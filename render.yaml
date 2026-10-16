@@ -1,0 +1,41 @@
+services:
+  - type: worker
+    name: bunker-tg-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: false
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PARA_GIFTS_WEBAPP_URL
+        sync: false
+
+  - type: web
+    name: bunker-tg-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: false
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PARA_GIFTS_WEBAPP_ORIGIN
+        sync: false
+
+  - type: web
+    name: bunker-tg-webapp
+    runtime: static
+    rootDir: webapp
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    autoDeploy: false
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
