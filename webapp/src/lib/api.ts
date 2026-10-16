@@ -36,6 +36,50 @@ export interface GiftSendResponse {
   message: string
 }
 
+export interface CatalogDiagnostics {
+  status: number | null
+  itemCount: number | null
+  initDataPresent: boolean
+  errorSummary: string | null
+  source: 'api' | 'demo' | 'not_requested'
+}
+
+export function shouldEnableCatalogDiagnostics(
+  isDevelopment: boolean,
+  flag: string | undefined,
+) {
+  return isDevelopment && flag === 'true'
+}
+
+export function createCatalogDiagnostics(
+  initData: string,
+  options: {
+    status?: number | null
+    itemCount?: number | null
+    error?: unknown
+    source?: CatalogDiagnostics['source']
+  } = {},
+): CatalogDiagnostics {
+  return {
+    status: options.status ?? null,
+    itemCount: options.itemCount ?? null,
+    initDataPresent: Boolean(initData),
+    errorSummary: options.error ? getSafeCatalogErrorSummary(options.error) : null,
+    source: options.source ?? 'not_requested',
+  }
+}
+
+export function getSafeCatalogErrorSummary(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.status === 401) return 'Telegram sessiyasi yaroqsiz yoki muddati tugagan.'
+    if (error.status === 403) return 'API so‘roviga ruxsat berilmadi.'
+    if (error.status === 503) return 'API yoki ma’lumotlar bazasi vaqtincha ishlamayapti.'
+    return `API so‘rovi xatosi (HTTP ${error.status}).`
+  }
+  if (error instanceof TypeError) return 'API bilan tarmoq aloqasi o‘rnatilmadi.'
+  return 'Katalog so‘rovini bajarib bo‘lmadi.'
+}
+
 export type Tab = 'home' | 'shop' | 'history'
 
 interface ApiErrorBody {
@@ -69,6 +113,7 @@ async function request<T>(
   path: string,
   initData: string,
   options: RequestInit = {},
+  onResponse?: (status: number) => void,
 ): Promise<T> {
   if (!initData) throw new Error('Telegram initData topilmadi.')
   const response = await fetch(`${getApiBaseUrl()}${path}`, {
@@ -79,6 +124,7 @@ async function request<T>(
       ...options.headers,
     },
   })
+  onResponse?.(response.status)
 
   if (!response.ok) {
     let detail = ''
@@ -98,11 +144,16 @@ export function fetchMe(initData: string) {
 }
 
 export async function fetchCatalog(initData: string) {
+  let status: number | null = null
   const response = await request<{ items: ShopGift[] }>(
     '/api/gifts/catalog',
     initData,
+    {},
+    (responseStatus) => {
+      status = responseStatus
+    },
   )
-  return response.items
+  return { items: response.items, status: status ?? 200 }
 }
 
 export function fetchGiftHistory(

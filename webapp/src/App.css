@@ -915,6 +915,27 @@
   background: rgb(20 22 32 / 84%);
 }
 
+.catalog-diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgb(255 196 113 / 24%);
+  border-radius: 12px;
+  color: #dbc9e8;
+  background: rgb(36 28 42 / 82%);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.catalog-diagnostics strong {
+  margin-bottom: 2px;
+  color: #ffd79f;
+  font-size: 12px;
+}
+
 .loading-card {
   color: #b7a0d4;
   font-size: 12px;

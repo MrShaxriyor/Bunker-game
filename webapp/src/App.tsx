@@ -22,13 +22,16 @@ import {
 import {
   ApiError,
   clearIdempotencyKey,
+  createCatalogDiagnostics,
   fetchCatalog,
   fetchGiftHistory,
   fetchMe,
   getOrCreateIdempotencyKey,
+  shouldEnableCatalogDiagnostics,
   sendGift,
 } from './lib/api'
 import type {
+  CatalogDiagnostics,
   GiftHistoryPage,
   GiftHistoryRecord,
   GiftSendResponse,
@@ -40,6 +43,10 @@ import { getTelegramWebApp } from './lib/telegram'
 import './App.css'
 
 const PAGE_SIZE = 20
+const catalogDiagnosticsEnabled = shouldEnableCatalogDiagnostics(
+  import.meta.env.DEV,
+  import.meta.env.VITE_PARA_GIFTS_DIAGNOSTICS,
+)
 const GIFT_EMOJIS = ['🌹', '🎁', '💌', '🧸', '💐', '✨']
 const UZBEK_MONTHS = [
   'yanvar',
@@ -130,6 +137,9 @@ function App() {
   const [catalogLoading, setCatalogLoading] = useState(true)
   const [profileLoading, setProfileLoading] = useState(true)
   const [catalogError, setCatalogError] = useState('')
+  const [catalogDiagnostics, setCatalogDiagnostics] = useState<CatalogDiagnostics>(
+    () => createCatalogDiagnostics(initData),
+  )
   const [profileError, setProfileError] = useState('')
   const [selectedGift, setSelectedGift] = useState<ShopGift | null>(null)
   const [sending, setSending] = useState(false)
@@ -178,19 +188,49 @@ function App() {
       setGifts(demoGifts)
       setCatalogError('')
       setCatalogLoading(false)
+      setCatalogDiagnostics(
+        createCatalogDiagnostics(initData, {
+          itemCount: demoGifts.length,
+          source: 'demo',
+        }),
+      )
       return
     }
     if (!initData) {
       setCatalogError('Katalogni ko‘rish uchun ilovani Telegram ichidan oching.')
       setCatalogLoading(false)
+      setCatalogDiagnostics(
+        createCatalogDiagnostics(initData, {
+          error: new Error('missing initData'),
+          source: 'not_requested',
+        }),
+      )
       return
     }
     setCatalogLoading(true)
     setCatalogError('')
+    setCatalogDiagnostics(
+      createCatalogDiagnostics(initData, { source: 'api' }),
+    )
     try {
-      setGifts(await fetchCatalog(initData))
+      const result = await fetchCatalog(initData)
+      setGifts(result.items)
+      setCatalogDiagnostics(
+        createCatalogDiagnostics(initData, {
+          status: result.status,
+          itemCount: result.items.length,
+          source: 'api',
+        }),
+      )
     } catch (error) {
       setCatalogError(getErrorMessage(error))
+      setCatalogDiagnostics(
+        createCatalogDiagnostics(initData, {
+          status: error instanceof ApiError ? error.status : null,
+          error,
+          source: 'api',
+        }),
+      )
     } finally {
       setCatalogLoading(false)
     }
@@ -386,6 +426,8 @@ function App() {
             gifts={gifts}
             loading={catalogLoading}
             error={catalogError}
+            diagnostics={catalogDiagnostics}
+            showDiagnostics={catalogDiagnosticsEnabled}
             onRetry={() => void loadCatalog()}
             onGift={openGift}
           />
@@ -552,44 +594,69 @@ function ShopPage({
   gifts,
   loading,
   error,
+  diagnostics,
+  showDiagnostics,
   onRetry,
   onGift,
 }: {
   gifts: ShopGift[]
   loading: boolean
   error: string
+  diagnostics: CatalogDiagnostics
+  showDiagnostics: boolean
   onRetry: () => void
   onGift: (gift: ShopGift) => void
 }) {
-  if (loading) return <LoadingCard label="Sovg‘alar yuklanmoqda..." />
-  if (error) return <ErrorCard message={error} onRetry={onRetry} />
+  const diagnosticsPanel = showDiagnostics ? (
+    <CatalogDiagnosticsPanel diagnostics={diagnostics} />
+  ) : null
+
+  if (loading) return <>{diagnosticsPanel}<LoadingCard label="Sovg‘alar yuklanmoqda..." /></>
+  if (error) return <>{diagnosticsPanel}<ErrorCard message={error} onRetry={onRetry} /></>
   if (!gifts.length) {
-    return (
+    return <>
+      {diagnosticsPanel}
       <EmptyState
         icon={<Gift size={27} />}
         title="Hozircha sovg‘alar yo‘q"
         description="Yangi sovg‘alar paydo bo‘lsa, shu yerda ko‘rasiz."
       />
-    )
+    </>
   }
 
   return (
-    <div className="shop-page">
-      <div className="shop-intro">
-        <span className="intro-spark"><Sparkles size={17} /></span>
-        <p>Har bir sovg‘ada bir chimdim mehr bor. O‘zingizga yoqqanini tanlang.</p>
+    <>
+      {diagnosticsPanel}
+      <div className="shop-page">
+        <div className="shop-intro">
+          <span className="intro-spark"><Sparkles size={17} /></span>
+          <p>Har bir sovg‘ada bir chimdim mehr bor. O‘zingizga yoqqanini tanlang.</p>
+        </div>
+        <div className="gift-grid">
+          {gifts.map((gift, index) => (
+            <GiftCard
+              key={gift.id}
+              gift={gift}
+              index={index}
+              onGift={() => onGift(gift)}
+            />
+          ))}
+        </div>
       </div>
-      <div className="gift-grid">
-        {gifts.map((gift, index) => (
-          <GiftCard
-            key={gift.id}
-            gift={gift}
-            index={index}
-            onGift={() => onGift(gift)}
-          />
-        ))}
-      </div>
-    </div>
+    </>
+  )
+}
+
+function CatalogDiagnosticsPanel({ diagnostics }: { diagnostics: CatalogDiagnostics }) {
+  return (
+    <aside className="catalog-diagnostics" aria-label="Katalog diagnostikasi">
+      <strong>Dev diagnostikasi</strong>
+      <span>Manba: {diagnostics.source === 'api' ? 'API' : diagnostics.source === 'demo' ? 'Demo' : 'So‘rov yuborilmadi'}</span>
+      <span>HTTP status: {diagnostics.status ?? '—'}</span>
+      <span>Sovg‘alar soni: {diagnostics.itemCount ?? '—'}</span>
+      <span>Telegram initData: {diagnostics.initDataPresent ? 'Bor' : 'Yo‘q'}</span>
+      <span>Xavfsiz xulosa: {diagnostics.errorSummary ?? 'Xato yo‘q'}</span>
+    </aside>
   )
 }
 

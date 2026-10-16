@@ -2,10 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiError,
   clearIdempotencyKey,
+  createCatalogDiagnostics,
   fetchCatalog,
   fetchGiftHistory,
   fetchMe,
   getOrCreateIdempotencyKey,
+  getSafeCatalogErrorSummary,
+  shouldEnableCatalogDiagnostics,
   sendGift,
 } from './api'
 
@@ -43,14 +46,16 @@ describe('Para Gifts API client', () => {
     )
   })
 
-  it('reads the catalog envelope and requests the selected history page', async () => {
+  it('reads a seven-item catalog and records the HTTP status and safe request headers', async () => {
+    const items = Array.from({ length: 7 }, (_, index) => ({
+      id: index + 1,
+      name: `Gift ${index + 1}`,
+      description: null,
+      price_coins: (index + 1) * 50,
+    }))
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(
-        jsonResponse({
-          items: [{ id: 5, name: 'Atirgul', description: null, price_coins: 25 }],
-        }),
-      )
+      .mockResolvedValueOnce(jsonResponse({ items }, 200))
       .mockResolvedValueOnce(
         jsonResponse({
           items: [],
@@ -61,14 +66,74 @@ describe('Para Gifts API client', () => {
       )
     vi.stubGlobal('fetch', fetchMock)
 
-    await expect(fetchCatalog('signed-init-data')).resolves.toEqual([
-      { id: 5, name: 'Atirgul', description: null, price_coins: 25 },
-    ])
+    await expect(fetchCatalog('signed-init-data')).resolves.toEqual({ items, status: 200 })
     await fetchGiftHistory('signed-init-data', 'received', 2, 20)
 
+    expect(fetchMock.mock.calls[0][0]).toBe(`${apiBaseUrl}/api/gifts/catalog`)
+    expect(fetchMock.mock.calls[0][1].method ?? 'GET').toBe('GET')
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      Authorization: 'tma signed-init-data',
+    })
     expect(fetchMock.mock.calls[1][0]).toBe(
       `${apiBaseUrl}/api/gifts/received?page=2&page_size=20`,
     )
+  })
+
+  it('preserves a successful empty catalog as a distinct zero-item result', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ items: [] }, 200)))
+
+    await expect(fetchCatalog('signed-init-data')).resolves.toEqual({
+      items: [],
+      status: 200,
+    })
+  })
+
+  it.each([
+    [401, 'Telegram sessiyasi yaroqsiz yoki muddati tugagan.'],
+    [403, 'API so‘roviga ruxsat berilmadi.'],
+    [503, 'API yoki ma’lumotlar bazasi vaqtincha ishlamayapti.'],
+  ])('summarizes HTTP %i without exposing the raw server detail', async (status, summary) => {
+    const rawDetail = 'secret-token-and-init-data-must-not-appear'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(jsonResponse({ detail: rawDetail }, status)),
+    )
+
+    let caughtError: unknown
+    try {
+      await fetchCatalog('signed-init-data')
+    } catch (error) {
+      caughtError = error
+    }
+
+    expect(caughtError).toBeInstanceOf(ApiError)
+    expect(caughtError).toMatchObject({ status, detail: rawDetail })
+    const safeSummary = getSafeCatalogErrorSummary(caughtError)
+    expect(safeSummary).toBe(summary)
+    expect(safeSummary).not.toContain(rawDetail)
+  })
+
+  it('uses a fixed summary for network errors', () => {
+    expect(getSafeCatalogErrorSummary(new TypeError('URL query secret=hidden'))).toBe(
+      'API bilan tarmoq aloqasi o‘rnatilmadi.',
+    )
+  })
+
+  it('reports only whether initData exists and never includes its value', () => {
+    const initData = 'sensitive-init-data-value'
+    const present = createCatalogDiagnostics(initData, { status: 200, itemCount: 7, source: 'api' })
+    const absent = createCatalogDiagnostics('', { source: 'not_requested' })
+
+    expect(present.initDataPresent).toBe(true)
+    expect(absent.initDataPresent).toBe(false)
+    expect(JSON.stringify(present)).not.toContain(initData)
+    expect(present).toMatchObject({ status: 200, itemCount: 7 })
+  })
+
+  it('cannot enable diagnostics in a production build even when the flag is true', () => {
+    expect(shouldEnableCatalogDiagnostics(true, 'true')).toBe(true)
+    expect(shouldEnableCatalogDiagnostics(true, 'false')).toBe(false)
+    expect(shouldEnableCatalogDiagnostics(false, 'true')).toBe(false)
   })
 
   it('sends only the backend gift request properties', async () => {
