@@ -203,9 +203,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="Bunker TG Para Gifts API",
-        docs_url=None,
+        docs_url="/docs",
         redoc_url=None,
-        openapi_url=None,
+        openapi_url="/openapi.json",
         lifespan=lifespan,
     )
     app.add_middleware(RequestBodyLimitMiddleware)

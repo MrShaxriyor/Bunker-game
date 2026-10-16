@@ -277,6 +277,18 @@ class ParaGiftsApiTests(unittest.IsolatedAsyncioTestCase):
             "Authorization": f"tma {make_init_data(user_id, auth_date=auth_date)}"
         }
 
+    async def test_docs_and_openapi_expose_registered_api_routes(self):
+        docs_response = await self.client.get("/docs")
+        schema_response = await self.client.get("/openapi.json")
+
+        self.assertEqual(docs_response.status_code, 200)
+        self.assertIn("text/html", docs_response.headers["content-type"])
+        self.assertEqual(schema_response.status_code, 200)
+        paths = schema_response.json()["paths"]
+        self.assertIn("/api/me", paths)
+        self.assertIn("/api/gifts/catalog", paths)
+        self.assertEqual(self.app.root_path, "")
+
     async def test_invalid_stale_and_client_supplied_ids_are_rejected(self):
         invalid_headers = self.auth_headers()
         invalid_headers["Authorization"] += "x"
