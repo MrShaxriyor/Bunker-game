@@ -637,7 +637,7 @@
   left: max(18px, env(safe-area-inset-left));
   display: grid;
   width: min(calc(100% - 36px), 470px);
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   margin: 0 auto;
   padding: 7px;
   border: 1px solid rgb(255 255 255 / 10%);
@@ -668,9 +668,152 @@
 }
 
 .shop-page,
-.history-page {
+.history-page,
+.inventory-page {
   display: grid;
   gap: 18px;
+}
+
+.inventory-intro {
+  margin: 0;
+  color: #aaa6b5;
+  font-size: 12px;
+}
+
+.inventory-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.inventory-card {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 13px;
+  padding: 12px;
+  border: 1px solid rgb(255 255 255 / 8%);
+  border-radius: 16px;
+  color: inherit;
+  background: linear-gradient(135deg, rgb(27 27 41 / 95%), rgb(19 21 31 / 95%));
+  text-align: left;
+  cursor: pointer;
+}
+
+.inventory-art,
+.inventory-detail-art {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgb(210 178 255 / 13%);
+  border-radius: 14px;
+  background: radial-gradient(circle at 50% 35%, rgb(213 174 255 / 17%), rgb(255 130 184 / 6%) 70%);
+}
+
+.inventory-art {
+  width: 66px;
+  height: 66px;
+  font-size: 34px;
+}
+
+.inventory-card-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+  gap: 5px;
+}
+
+.inventory-card-copy strong {
+  overflow: hidden;
+  color: #f2eef7;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inventory-card-copy small {
+  color: #9692a2;
+  font-size: 10px;
+}
+
+.inventory-status {
+  width: fit-content;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #a8dace;
+  background: rgb(131 232 207 / 8%);
+  font-size: 9px;
+}
+
+.inventory-status-sold {
+  color: #c2b1d7;
+  background: rgb(194 177 215 / 9%);
+}
+
+.inventory-resale-price {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 4px;
+  color: #f4d88b;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.inventory-dialog {
+  text-align: center;
+}
+
+.inventory-detail-art {
+  width: 130px;
+  height: 130px;
+  margin: 12px auto 17px;
+  border-radius: 27px;
+  font-size: 68px;
+  box-shadow: 0 12px 44px rgb(169 118 255 / 12%);
+}
+
+.inventory-detail-list {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0;
+  padding: 14px;
+  border: 1px solid rgb(255 255 255 / 7%);
+  border-radius: 14px;
+  background: rgb(255 255 255 / 2%);
+  text-align: left;
+}
+
+.inventory-detail-list span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: #9a96a6;
+  font-size: 10px;
+}
+
+.inventory-detail-list strong {
+  color: #e9e5ef;
+  text-align: right;
+}
+
+.inventory-confirm-box {
+  display: grid;
+  gap: 8px;
+}
+
+.inventory-confirm-box > strong,
+.inventory-sold-note {
+  color: #d0c9d8;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.inventory-success {
+  margin: 10px 0;
+  color: #a8dace;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .shop-intro {

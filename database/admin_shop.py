@@ -112,6 +112,29 @@ async def get_shop_item_page(page: int = 0) -> AdminPage:
     return await _page_query(ShopItem, page)
 
 
+async def get_para_gift_page(page: int = 0) -> AdminPage:
+    if type(page) is not int or page < 0:
+        raise AdminShopValidationError("Sahifa raqami noto‘g‘ri.")
+    try:
+        async with get_sessionmaker()() as session:
+            query = select(ShopItem).where(ShopItem.item_type == "para_gift")
+            total = await session.scalar(
+                select(func.count()).select_from(ShopItem).where(
+                    ShopItem.item_type == "para_gift"
+                )
+            ) or 0
+            page_count = (total + ADMIN_PAGE_SIZE - 1) // ADMIN_PAGE_SIZE
+            page = min(page, max(page_count - 1, 0))
+            entries = await session.scalars(
+                query.order_by(ShopItem.id.desc())
+                .limit(ADMIN_PAGE_SIZE).offset(page * ADMIN_PAGE_SIZE)
+            )
+            return AdminPage(list(entries.all()), page, page_count, total)
+    except SQLAlchemyError as error:
+        _log_error(error)
+        raise AdminShopStorageError("Para Gifts ro‘yxatini olib bo‘lmadi.") from None
+
+
 async def get_coin_package_page(page: int = 0) -> AdminPage:
     return await _page_query(CoinPackage, page)
 
@@ -188,6 +211,26 @@ async def update_shop_item_price(item_id: int, price_coins: int) -> ShopItem:
     except SQLAlchemyError as error:
         _log_error(error)
         raise AdminShopStorageError("Buyum narxini o‘zgartirib bo‘lmadi.") from None
+
+
+async def update_shop_item_name(item_id: int, name: str) -> ShopItem:
+    name = _validate_text(name, "Buyum nomi", 255)
+    try:
+        async with get_sessionmaker()() as session:
+            async with session.begin():
+                item = await session.scalar(
+                    select(ShopItem).where(ShopItem.id == item_id).with_for_update()
+                )
+                if item is None:
+                    raise AdminShopValidationError("Buyum topilmadi.")
+                item.name = name
+                await session.flush()
+                return item
+    except AdminShopValidationError:
+        raise
+    except SQLAlchemyError as error:
+        _log_error(error)
+        raise AdminShopStorageError("Buyum nomini o‘zgartirib bo‘lmadi.") from None
 
 
 async def toggle_shop_item(item_id: int) -> ShopItem:

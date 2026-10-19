@@ -25,6 +25,7 @@ from ui.keyboards import (
     admin_coin_package_keyboard,
     admin_coin_packages_keyboard,
     admin_payment_history_keyboard,
+    admin_para_gifts_keyboard,
     admin_shop_item_keyboard,
     admin_shop_items_keyboard,
     admin_wallet_adjust_confirmation_keyboard,
@@ -42,6 +43,7 @@ class AdminShopStates(StatesGroup):
     item_category = State()
     item_price = State()
     item_price_edit = State()
+    item_name_edit = State()
     package_name = State()
     package_code = State()
     package_coins = State()
@@ -133,7 +135,28 @@ async def _show_item_detail(
     await _edit_callback(
         callback,
         texts.admin_shop_item_text(item),
-        admin_shop_item_keyboard(item.id, page, active=item.is_active),
+        admin_shop_item_keyboard(
+            item.id, page, active=item.is_active,
+            para_gift=item.item_type == "para_gift",
+        ),
+    )
+
+
+async def _show_para_gift_page(callback: CallbackQuery, page: int) -> None:
+    try:
+        result = await admin_shop_service.get_para_gift_page(page)
+    except admin_shop_service.AdminShopError as error:
+        logger.error("Admin Para Gifts list failed: error_type=%s", type(error).__name__)
+        await callback.answer("Para Gifts ro‘yxatini olib bo‘lmadi.", show_alert=True)
+        return
+    entries = [(x.id, x.name, x.code, x.price_coins, x.is_active) for x in result.entries]
+    message = (
+        f"🎁 <b>Para Gifts katalogi</b>\nSovg‘alar: <b>{result.total}</b>"
+        if result.total else "🎁 <b>Para Gifts katalogi</b>\n\nHozircha sovg‘alar yo‘q."
+    )
+    await _edit_callback(
+        callback, message,
+        admin_para_gifts_keyboard(entries, result.page, result.page_count),
     )
 
 
@@ -267,6 +290,19 @@ async def handle_admin_shop_callback(
         if page is not None:
             await _show_item_page(callback, page)
             return
+    elif parts[2] == "gifts" and len(parts) == 4:
+        page = _parse_nonnegative_page(parts[3])
+        if page is not None:
+            await _show_para_gift_page(callback, page)
+            return
+    elif parts[2] == "gift" and parts[3:] == ["new"]:
+        if isinstance(callback.message, Message):
+            await state.clear()
+            await state.update_data(item_category="para_gift")
+            await state.set_state(AdminShopStates.item_name)
+            await callback.message.edit_text("Yangi sovg‘a nomini yuboring. /cancel — bekor qilish.")
+        await callback.answer()
+        return
     elif parts[2] == "item":
         if len(parts) == 4 and parts[3] == "new":
             if isinstance(callback.message, Message):
@@ -277,7 +313,7 @@ async def handle_admin_shop_callback(
                 )
             await callback.answer()
             return
-        if len(parts) == 6 and parts[3] in {"view", "price", "toggle"}:
+        if len(parts) == 6 and parts[3] in {"view", "price", "name", "toggle"}:
             item_id = _parse_positive_integer(parts[4])
             page = _parse_nonnegative_page(parts[5])
             if item_id is None or page is None:
@@ -299,8 +335,19 @@ async def handle_admin_shop_callback(
                 await _edit_callback(
                     callback,
                     texts.admin_shop_item_text(item),
-                    admin_shop_item_keyboard(item.id, page, active=item.is_active),
+                    admin_shop_item_keyboard(
+                        item.id, page, active=item.is_active,
+                        para_gift=item.item_type == "para_gift",
+                    ),
                 )
+                return
+            if parts[3] == "name":
+                if isinstance(callback.message, Message):
+                    await state.clear()
+                    await state.update_data(shop_item_id=item_id, item_page=page)
+                    await state.set_state(AdminShopStates.item_name_edit)
+                    await callback.message.edit_text("Yangi buyum nomini yuboring (255 belgigacha).")
+                await callback.answer()
                 return
             if isinstance(callback.message, Message):
                 await state.clear()
@@ -492,6 +539,7 @@ async def _confirm_wallet_adjustment(
         AdminShopStates.item_category,
         AdminShopStates.item_price,
         AdminShopStates.item_price_edit,
+        AdminShopStates.item_name_edit,
         AdminShopStates.package_name,
         AdminShopStates.package_code,
         AdminShopStates.package_coins,
@@ -544,6 +592,9 @@ async def receive_admin_shop_input(message: Message, state: FSMContext) -> None:
     if current in transitions:
         key, next_state, prompt = transitions[current]
         await state.update_data(**{key: None if key == "item_description" and value == "-" else value})
+        if current == AdminShopStates.item_description.state and data.get("item_category") == "para_gift":
+            next_state = AdminShopStates.item_price
+            prompt = "Sovg‘a narxini coin hisobida musbat butun son bilan yuboring."
         await state.set_state(next_state)
         await message.answer(prompt)
         return
@@ -581,7 +632,9 @@ async def receive_admin_shop_input(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(
             texts.admin_shop_item_text(item),
-            reply_markup=admin_shop_item_keyboard(item.id, 0, active=True),
+            reply_markup=admin_shop_item_keyboard(
+                item.id, 0, active=True, para_gift=item.item_type == "para_gift"
+            ),
             parse_mode="HTML",
         )
         return
@@ -603,6 +656,27 @@ async def receive_admin_shop_input(message: Message, state: FSMContext) -> None:
                 item.id,
                 data.get("item_page", 0),
                 active=item.is_active,
+                para_gift=item.item_type == "para_gift",
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    if current == AdminShopStates.item_name_edit.state:
+        try:
+            item = await admin_shop_service.update_shop_item_name(
+                data["shop_item_id"], value
+            )
+        except admin_shop_service.AdminShopError as error:
+            await state.clear()
+            await message.answer(str(error))
+            return
+        await state.clear()
+        await message.answer(
+            texts.admin_shop_item_text(item),
+            reply_markup=admin_shop_item_keyboard(
+                item.id, data.get("item_page", 0), active=item.is_active,
+                para_gift=item.item_type == "para_gift",
             ),
             parse_mode="HTML",
         )

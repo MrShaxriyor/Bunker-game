@@ -42,13 +42,17 @@ def create_game_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def lobby_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+def lobby_keyboard(
+    bot_username: str,
+    game_id: int,
+    chat_id: int,
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    _add_button(
-        builder,
-        "🟢 ➕ O‘yinga qo‘shilish",
-        f"bunker:join:{chat_id}",
-        "success",
+    builder.add(
+        InlineKeyboardButton(
+            text="🟢 ➕ O‘yinga qo‘shilish",
+            url=f"https://t.me/{bot_username}?start=join_{game_id}",
+        )
     )
     _add_button(
         builder,
@@ -152,6 +156,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     _add_button(builder, "💰 Coin paketlari", "admin:shop:packages:0", "primary")
     _add_button(builder, "👛 Hamyon qidirish", "admin:shop:wallet", "primary")
     _add_button(builder, "🧾 To‘lovlar tarixi", "admin:shop:payments:0", "primary")
+    _add_button(builder, "🔐 A’zolik talabi", "admin:membership", "primary")
+    _add_button(builder, "🎁 Para Gifts", "admin:shop:gifts:0", "primary")
     _add_button(builder, "🔄 Yangilash", "admin:refresh", "success")
     _add_button(builder, "❌ Yopish", "admin:close", "danger")
     builder.adjust(1)
@@ -594,13 +600,36 @@ def admin_shop_items_keyboard(
     return builder.as_markup()
 
 
+def admin_para_gifts_keyboard(
+    entries: list[tuple[int, str, str, int, bool]],
+    page: int,
+    page_count: int,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for item_id, name, code, price, active in entries:
+        status = "✅" if active else "⏸️"
+        _add_button(builder, f"{status} {name} · {price} 🪙"[:64],
+                    f"admin:shop:item:view:{item_id}:{page}", "primary")
+    _add_button(builder, "➕ Sovg‘a yaratish", "admin:shop:gift:new", "success")
+    if page > 0:
+        _add_button(builder, "⬅️ Oldingi", f"admin:shop:gifts:{page - 1}", "primary")
+    if page + 1 < page_count:
+        _add_button(builder, "Keyingi ➡️", f"admin:shop:gifts:{page + 1}", "primary")
+    _add_button(builder, "↩️ Admin menyu", "admin:menu", "primary")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def admin_shop_item_keyboard(
     item_id: int,
     page: int,
     *,
     active: bool,
+    para_gift: bool = False,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    _add_button(builder, "✏️ Nomini o‘zgartirish",
+                f"admin:shop:item:name:{item_id}:{page}", "primary")
     _add_button(
         builder,
         "💰 Narxni o‘zgartirish",
@@ -613,7 +642,12 @@ def admin_shop_item_keyboard(
         f"admin:shop:item:toggle:{item_id}:{page}",
         "danger" if active else "success",
     )
-    _add_button(builder, "⬅️ Buyumlar", f"admin:shop:items:{page}", "primary")
+    _add_button(
+        builder,
+        "⬅️ Para Gifts" if para_gift else "⬅️ Buyumlar",
+        f"admin:shop:gifts:{page}" if para_gift else f"admin:shop:items:{page}",
+        "primary",
+    )
     _add_button(builder, "↩️ Admin menyu", "admin:menu", "primary")
     builder.adjust(1)
     return builder.as_markup()

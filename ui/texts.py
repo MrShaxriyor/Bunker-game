@@ -1,6 +1,7 @@
 """Consistent HTML-formatted text for Bunker TG messages."""
 
 from html import escape
+import re
 from typing import Iterable, Mapping
 
 HTML_PARSE_MODE = "HTML"
@@ -14,6 +15,18 @@ _CARD_LABELS = {
     "bagaj": "🎒 Bagaj",
     "sir": "🤫 Sir",
 }
+
+_TELEGRAM_USERNAME = re.compile(r"[A-Za-z0-9_]{5,32}\Z")
+
+
+def player_name_html(name: str, username: str | None = None) -> str:
+    """Format a safe public profile link when a valid Telegram username exists."""
+    safe_name = escape(name)
+    normalized_username = username.lstrip("@") if username else ""
+    if not _TELEGRAM_USERNAME.fullmatch(normalized_username):
+        return f"<b>{safe_name}</b>"
+    href = f"https://t.me/{normalized_username}"
+    return f'<a href="{escape(href, quote=True)}"><b>{safe_name}</b></a>'
 
 
 def welcome_text() -> str:
@@ -196,6 +209,8 @@ def admin_stats_text(
     cancelled_games: int,
     unique_players: int,
     total_rounds: int,
+    registered_users: int = 0,
+    registered_today: int = 0,
 ) -> str:
     return (
         "📊 <b>Bot statistikasi</b>\n\n"
@@ -205,7 +220,9 @@ def admin_stats_text(
         f"🏁 Yakunlangan: <b>{completed_games}</b>\n"
         f"🚫 Bekor qilingan: <b>{cancelled_games}</b>\n"
         f"👥 Noyob o‘yinchilar: <b>{unique_players}</b>\n"
-        f"🔄 Jami raundlar: <b>{total_rounds}</b>"
+        f"🔄 Jami raundlar: <b>{total_rounds}</b>\n"
+        f"🧾 Ro‘yxatdan o‘tganlar: <b>{registered_users}</b>\n"
+        f"📅 Bugun ro‘yxatdan o‘tganlar (Toshkent): <b>{registered_today}</b>"
     )
 
 
@@ -497,13 +514,8 @@ def round_started_text(
 ) -> str:
     player_lines = []
     for user_id, name, username in living_players:
-        profile_url = (
-            f"https://t.me/{escape(username.lstrip('@'), quote=True)}"
-            if username
-            else f"tg://user?id={user_id}"
-        )
         player_lines.append(
-            f'• <a href="{escape(profile_url, quote=True)}">{escape(name)}</a>'
+            f"• {player_name_html(name, username)}"
         )
     roster = "\n".join(player_lines) or "Hozircha tirik o‘yinchi yo‘q."
     return (
@@ -531,11 +543,12 @@ def card_announcement_text(
     category: str,
     value: str,
     automatic: bool = False,
+    username: str | None = None,
 ) -> str:
     label = _CARD_LABELS.get(category, escape(category.title()))
     opening = "avtomatik karta ochdi" if automatic else "kartasini ochdi"
     return (
-        f"🎴 <b>{escape(player_name)}</b> {opening}.\n\n"
+        f"🎴 {player_name_html(player_name, username)} {opening}.\n\n"
         f"{label}: {escape(value)}"
     )
 
@@ -608,15 +621,11 @@ def vote_leader_text(target_name: str, vote_count: int) -> str:
 
 def confirmation_text(
     target_name: str,
-    profile_url: str | None = None,
+    username: str | None = None,
     yes_count: int = 0,
     no_count: int = 0,
 ) -> str:
-    candidate = escape(target_name)
-    if profile_url:
-        candidate = (
-            f'<a href="{escape(profile_url, quote=True)}">{candidate}</a>'
-        )
+    candidate = player_name_html(target_name, username)
     return (
         "⚖️ <b>CHIQARISH BO‘YICHA QAROR</b>\n\n"
         f"👤 <b>Nomzod:</b> {candidate}\n\n"
@@ -669,15 +678,10 @@ def inactive_players_removed_text(player_names: Iterable[str]) -> str:
 
 def winners_text(winners: Iterable[tuple[int, str, str | None]]) -> str:
     winner_lines = []
-    for rank, (user_id, name, username) in enumerate(winners, start=1):
-        profile_url = (
-            f"https://t.me/{escape(username.lstrip('@'), quote=True)}"
-            if username
-            else f"tg://user?id={user_id}"
-        )
+    for rank, (_user_id, name, username) in enumerate(winners, start=1):
         winner_lines.append(
             f'{"🥇" if rank == 1 else "🥈"} '
-            f'<a href="{escape(profile_url, quote=True)}">{escape(name)}</a>'
+            f"{player_name_html(name, username)}"
         )
     return (
         "🏆 <b>BUNKER SURVIVAL — O‘YIN YAKUNLANDI!</b>\n\n"

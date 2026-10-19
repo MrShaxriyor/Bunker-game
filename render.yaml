@@ -13,7 +13,7 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: PARA_GIFTS_WEBAPP_URL
-        sync: false
+        value: https://bunker-game-frwj.onrender.com
 
   - type: web
     name: bunker-tg-api
@@ -27,7 +27,7 @@ services:
       - key: DATABASE_URL
         sync: false
       - key: PARA_GIFTS_WEBAPP_ORIGIN
-        sync: false
+        value: https://bunker-game-frwj.onrender.com
 
   - type: web
     name: bunker-tg-webapp
@@ -38,4 +38,4 @@ services:
     autoDeploy: false
     envVars:
       - key: VITE_API_BASE_URL
-        sync: false
+        value: https://bunker-game-h223.onrender.com

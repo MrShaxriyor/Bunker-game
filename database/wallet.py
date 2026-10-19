@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.engine import get_sessionmaker
-from database.models import PlayerWallet, WalletTransaction
+from database.models import BotUser, PlayerWallet, WalletTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +20,13 @@ WalletReason = Literal[
     "shop_purchase",
     "admin_adjustment",
     "payment",
+    "gift_resale",
+    "coin_transfer",
+    "coin_transfer_fee",
 ]
 WalletDirection = Literal["credit", "debit"]
+COIN_TRANSFER_FEE = 10
+MAX_COIN_TRANSFER = 1_000_000
 
 _VALID_REASONS = {
     "daily_bonus",
@@ -29,6 +34,9 @@ _VALID_REASONS = {
     "shop_purchase",
     "admin_adjustment",
     "payment",
+    "gift_resale",
+    "coin_transfer",
+    "coin_transfer_fee",
 }
 
 
@@ -60,10 +68,25 @@ class WalletStorageError(WalletError):
     """Raised when a wallet operation cannot be persisted."""
 
 
+class WalletAccountNotFound(WalletError):
+    """Raised when either participant is not a registered wallet user."""
+
+
+class DuplicateWalletTransfer(WalletError):
+    """Raised when the same Telegram command is replayed."""
+
+
 @dataclass(frozen=True)
 class WalletOperationResult:
     transaction_id: int
     balance_coins: int
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class CoinTransferResult:
+    sender_balance_coins: int
+    recipient_balance_coins: int
     replayed: bool
 
 
@@ -314,6 +337,62 @@ async def add_coins(
     )
 
 
+async def add_coins_in_session(
+    session: AsyncSession,
+    telegram_user_id: int,
+    amount: int,
+    *,
+    reason: WalletReason,
+    idempotency_key: str,
+    note: str | None = None,
+) -> WalletOperationResult:
+    """Credit an existing transaction without opening a nested DB transaction."""
+    _validate_operation(
+        telegram_user_id,
+        amount,
+        reason,
+        idempotency_key,
+        note,
+    )
+    wallet = await _get_or_create_locked_wallet(session, telegram_user_id)
+    existing = await session.scalar(
+        select(WalletTransaction).where(
+            WalletTransaction.idempotency_key == idempotency_key
+        )
+    )
+    if existing is not None:
+        _ensure_same_operation(
+            existing,
+            telegram_user_id,
+            "credit",
+            amount,
+            reason,
+            note,
+        )
+        return WalletOperationResult(
+            transaction_id=existing.id,
+            balance_coins=wallet.balance_coins,
+            replayed=True,
+        )
+
+    wallet.balance_coins += amount
+    transaction = WalletTransaction(
+        telegram_user_id=telegram_user_id,
+        direction="credit",
+        amount_coins=amount,
+        reason=reason,
+        note=note.strip() if note else None,
+        idempotency_key=idempotency_key,
+    )
+    session.add(transaction)
+    await session.flush()
+    return WalletOperationResult(
+        transaction_id=transaction.id,
+        balance_coins=wallet.balance_coins,
+        replayed=False,
+    )
+
+
 async def spend_coins(
     telegram_user_id: int,
     amount: int,
@@ -331,6 +410,128 @@ async def spend_coins(
         idempotency_key=idempotency_key,
         note=note,
     )
+
+
+async def transfer_coins(
+    sender_id: int,
+    recipient_id: int,
+    amount: int,
+    *,
+    idempotency_key: str,
+) -> CoinTransferResult:
+    """Transfer coins and record transfer plus fee in one DB transaction."""
+    _validate_user_id(sender_id)
+    _validate_user_id(recipient_id)
+    if sender_id == recipient_id:
+        raise InvalidWalletOperation("O‘zingizga coin yubora olmaysiz.")
+    if type(amount) is not int or not 1 <= amount <= MAX_COIN_TRANSFER:
+        raise InvalidWalletOperation("Coin miqdori ruxsat etilgan chegarada emas.")
+    if (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key.startswith("coin-transfer:")
+        or len(idempotency_key) > 128
+    ):
+        raise InvalidWalletOperation("Coin o‘tkazma kaliti noto‘g‘ri.")
+
+    sender_key = f"{idempotency_key}:send"
+    fee_key = f"{idempotency_key}:fee"
+    recipient_key = f"{idempotency_key}:receive"
+    expected_total = amount + COIN_TRANSFER_FEE
+    try:
+        async with get_sessionmaker()() as session:
+            async with session.begin():
+                # Lock in stable order so concurrent transfers in opposite
+                # directions cannot deadlock each other.
+                accounts = list((await session.scalars(
+                    select(BotUser)
+                    .where(BotUser.telegram_user_id.in_((sender_id, recipient_id)))
+                    .order_by(BotUser.telegram_user_id)
+                    .with_for_update()
+                )).all())
+                if len(accounts) != 2:
+                    raise WalletAccountNotFound
+
+                wallets = list((await session.scalars(
+                    select(PlayerWallet)
+                    .where(PlayerWallet.telegram_user_id.in_((sender_id, recipient_id)))
+                    .order_by(PlayerWallet.telegram_user_id)
+                    .with_for_update()
+                )).all())
+                if len(wallets) != 2:
+                    raise WalletAccountNotFound
+                wallet_by_user = {row.telegram_user_id: row for row in wallets}
+                sender = wallet_by_user[sender_id]
+                recipient = wallet_by_user[recipient_id]
+
+                keys = (sender_key, fee_key, recipient_key)
+                existing = list((await session.scalars(
+                    select(WalletTransaction).where(
+                        WalletTransaction.idempotency_key.in_(keys)
+                    )
+                )).all())
+                if existing:
+                    by_key = {row.idempotency_key: row for row in existing}
+                    if set(by_key) != set(keys):
+                        raise WalletStorageError("Coin o‘tkazma ledgeri to‘liq emas.")
+                    expected_rows = (
+                        (sender_key, sender_id, "debit", amount, "coin_transfer"),
+                        (fee_key, sender_id, "debit", COIN_TRANSFER_FEE, "coin_transfer_fee"),
+                        (recipient_key, recipient_id, "credit", amount, "coin_transfer"),
+                    )
+                    for key, user_id, direction, coins, reason in expected_rows:
+                        row = by_key[key]
+                        if (
+                            row.telegram_user_id != user_id
+                            or row.direction != direction
+                            or row.amount_coins != coins
+                            or row.reason != reason
+                        ):
+                            raise IdempotencyConflict
+                    raise DuplicateWalletTransfer
+
+                if sender.balance_coins < expected_total:
+                    raise InsufficientFunds(sender.balance_coins, expected_total)
+
+                sender.balance_coins -= expected_total
+                recipient.balance_coins += amount
+                session.add_all((
+                    WalletTransaction(
+                        telegram_user_id=sender_id,
+                        direction="debit",
+                        amount_coins=amount,
+                        reason="coin_transfer",
+                        note=f"Coin transfer to {recipient_id}",
+                        idempotency_key=sender_key,
+                    ),
+                    WalletTransaction(
+                        telegram_user_id=sender_id,
+                        direction="debit",
+                        amount_coins=COIN_TRANSFER_FEE,
+                        reason="coin_transfer_fee",
+                        note="Coin transfer fee sink",
+                        idempotency_key=fee_key,
+                    ),
+                    WalletTransaction(
+                        telegram_user_id=recipient_id,
+                        direction="credit",
+                        amount_coins=amount,
+                        reason="coin_transfer",
+                        note=f"Coin transfer from {sender_id}",
+                        idempotency_key=recipient_key,
+                    ),
+                ))
+                await session.flush()
+                return CoinTransferResult(
+                    sender_balance_coins=sender.balance_coins,
+                    recipient_balance_coins=recipient.balance_coins,
+                    replayed=False,
+                )
+    except (WalletAccountNotFound, InsufficientFunds, InvalidWalletOperation,
+            IdempotencyConflict, DuplicateWalletTransfer, WalletStorageError):
+        raise
+    except SQLAlchemyError as error:
+        _log_storage_error(error)
+        raise WalletStorageError("Coin o‘tkazmasini saqlab bo‘lmadi.") from None
 
 
 async def get_transaction_history(

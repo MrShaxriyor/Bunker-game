@@ -5,11 +5,13 @@ import {
   createCatalogDiagnostics,
   fetchCatalog,
   fetchGiftHistory,
+  fetchGiftInventory,
   fetchMe,
   getOrCreateIdempotencyKey,
   getSafeCatalogErrorSummary,
   shouldEnableCatalogDiagnostics,
   sendGift,
+  sellGiftInventoryItem,
 } from './api'
 
 const jsonResponse = (payload: unknown, status = 200) =>
@@ -159,6 +161,62 @@ describe('Para Gifts API client', () => {
         }),
       },
     ])
+  })
+
+  it('loads only the authenticated user inventory through the API client', async () => {
+    const item = {
+      id: 9,
+      sender_id: 101,
+      recipient_id: 202,
+      sender_name: 'Sender',
+      recipient_name: 'Partner',
+      gift_name: '🌹 Rose',
+      image_emoji: '🌹',
+      received_at: '2026-10-19T10:00:00Z',
+      original_price_coins: 300,
+      resale_price_coins: 150,
+      sold_at: null,
+      status: 'owned',
+    }
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ items: [item] }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(fetchGiftInventory('signed-init-data')).resolves.toEqual({ items: [item] })
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${apiBaseUrl}/api/gifts/inventory`,
+      expect.objectContaining({ headers: { Authorization: 'tma signed-init-data' } }),
+    )
+  })
+
+  it('sells an inventory copy via the authenticated backend endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      item: {
+        id: 9,
+        sender_id: 101,
+        recipient_id: 202,
+        sender_name: 'Sender',
+        recipient_name: 'Partner',
+        gift_name: '🌹 Rose',
+        image_emoji: '🌹',
+        received_at: '2026-10-19T10:00:00Z',
+        original_price_coins: 300,
+        resale_price_coins: 150,
+        sold_at: '2026-10-19T11:00:00Z',
+        status: 'sold',
+      },
+      balance_coins: 150,
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await sellGiftInventoryItem('signed-init-data', 9)
+    expect(result.balance_coins).toBe(150)
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${apiBaseUrl}/api/gifts/inventory/9/sell`,
+      expect.objectContaining({
+        method: 'POST',
+        headers: { Authorization: 'tma signed-init-data' },
+      }),
+    )
   })
 
   it('reuses the pending idempotency key for retries until it is cleared', () => {

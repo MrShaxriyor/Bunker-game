@@ -54,3 +54,27 @@ class GiftSendResponse(BaseModel):
     balance_coins: int
     replayed: bool
     message: str
+
+
+class GiftInventoryRecord(BaseModel):
+    id: int
+    sender_id: int
+    recipient_id: int
+    sender_name: str
+    recipient_name: str
+    gift_name: str
+    image_emoji: str
+    received_at: datetime
+    original_price_coins: int
+    resale_price_coins: int
+    sold_at: datetime | None
+    status: str
+
+
+class GiftInventoryResponse(BaseModel):
+    items: list[GiftInventoryRecord]
+
+
+class GiftInventorySellResponse(BaseModel):
+    item: GiftInventoryRecord
+    balance_coins: int

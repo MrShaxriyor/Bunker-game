@@ -3,19 +3,24 @@ from dataclasses import dataclass, field
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from html import escape
+from functools import wraps
 from typing import Literal
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, ChatPermissions, Message
-from sqlalchemy import select, update
+from aiogram.types import CallbackQuery, ChatPermissions, LinkPreviewOptions, Message
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from database.blocks import is_user_blocked, lock_user_for_block_check
 from database.engine import get_sessionmaker
-from database.models import Game, GamePlayer, GameRound, PlayerCard
+from database.models import (
+    Game, GamePlayer, GameRound, PlayerCard, PlayerWallet, WalletTransaction,
+)
 from data.cards import deal_cards, format_private_cards
 from ui import texts
 from ui.keyboards import (
@@ -27,6 +32,22 @@ from ui.keyboards import (
 
 router = Router()
 logger = logging.getLogger(__name__)
+_lobby_creation_locks: dict[int, asyncio.Lock] = {}
+
+
+def _serialize_lobby_creation(handler):
+    @wraps(handler)
+    async def wrapped(message: Message):
+        if message.chat.type not in ("group", "supergroup"):
+            return await handler(message)
+        lock = _lobby_creation_locks.setdefault(
+            message.chat.id,
+            asyncio.Lock(),
+        )
+        async with lock:
+            return await handler(message)
+
+    return wrapped
 
 MIN_PLAYERS = 4
 MAX_PLAYERS = 16
@@ -436,51 +457,98 @@ async def _persist_game_completion(
     lobby: "Lobby",
     first_winner_id: int | None,
     second_winner_id: int | None,
-) -> bool:
+) -> dict[int, int] | None:
     finished_at = datetime.now(timezone.utc)
     try:
         async with get_sessionmaker()() as session:
             async with session.begin():
-                result = await session.execute(
-                    update(Game)
-                    .where(
-                        Game.chat_id == lobby.chat_id,
-                        Game.status == "active",
-                    )
-                    .values(
-                        status="completed",
-                        phase="finished",
-                        phase_started_at=finished_at,
-                        phase_deadline_at=None,
-                        finished_at=finished_at,
-                        first_winner_id=first_winner_id,
-                        second_winner_id=second_winner_id,
-                        version=Game.version + 1,
-                    )
+                game = await session.scalar(
+                    select(Game)
+                    .where(Game.chat_id == lobby.chat_id, Game.status == "active")
+                    .with_for_update()
                 )
-                if result.rowcount != 1:
+                if game is None:
                     logger.error(
-                        "O‘yinni DB’da yakunlab bo‘lmadi: "
-                        "chat_id=%s, affected_rows=%s",
+                        "O‘yinni DB’da yakunlab bo‘lmadi: chat_id=%s, active_game_missing",
                         lobby.chat_id,
-                        result.rowcount,
                     )
-                    return False
+                    return None
+                players = list((await session.scalars(
+                    select(GamePlayer).where(GamePlayer.game_id == game.id)
+                    .order_by(GamePlayer.telegram_user_id)
+                )).all())
+                try:
+                    reward_amounts = calculate_game_reward_amounts(
+                        {player.telegram_user_id for player in players},
+                        first_winner_id,
+                        second_winner_id,
+                    )
+                except ValueError:
+                    logger.error("Game reward participants invalid: game_id=%s", game.id)
+                    return None
+
+                for player in players:
+                    amount = reward_amounts[player.telegram_user_id]
+                    await session.execute(
+                        pg_insert(PlayerWallet)
+                        .values(telegram_user_id=player.telegram_user_id)
+                        .on_conflict_do_nothing(
+                            constraint="uq_player_wallets_telegram_user_id"
+                        )
+                    )
+                    wallet = await session.scalar(
+                        select(PlayerWallet)
+                        .where(PlayerWallet.telegram_user_id == player.telegram_user_id)
+                        .with_for_update()
+                    )
+                    key = f"game-reward:{game.id}:{player.telegram_user_id}"
+                    existing = await session.scalar(
+                        select(WalletTransaction).where(
+                            WalletTransaction.idempotency_key == key
+                        )
+                    )
+                    if existing is None:
+                        wallet.balance_coins += amount
+                        session.add(WalletTransaction(
+                            telegram_user_id=player.telegram_user_id,
+                            direction="credit",
+                            amount_coins=amount,
+                            reason="game_reward",
+                            note=f"Game {game.id} yakuniy mukofoti",
+                            idempotency_key=key,
+                        ))
+                    elif (
+                        existing.telegram_user_id != player.telegram_user_id
+                        or existing.direction != "credit"
+                        or existing.amount_coins != amount
+                        or existing.reason != "game_reward"
+                    ):
+                        raise RuntimeError("Game reward idempotency conflict")
+                game.status = "completed"
+                game.phase = "finished"
+                game.phase_started_at = finished_at
+                game.phase_deadline_at = None
+                game.finished_at = finished_at
+                game.first_winner_id = first_winner_id
+                game.second_winner_id = second_winner_id
+                game.version += 1
+                await session.flush()
+                return reward_amounts
     except (SQLAlchemyError, RuntimeError) as error:
         logger.error(
             "O‘yinni DB’da yakunlashda xato: chat_id=%s, error_type=%s",
             lobby.chat_id,
             type(error).__name__,
         )
-        return False
-
-    return True
+        return None
 
 
 @dataclass
 class Lobby:
     chat_id: int
     host_id: int
+    game_id: int | None = None
+    bot_username: str | None = None
 
     players: dict[int, str] = field(default_factory=dict)
     usernames: dict[int, str | None] = field(default_factory=dict)
@@ -516,9 +584,40 @@ class Lobby:
 lobbies: dict[int, Lobby] = {}
 
 
+def parse_join_game_payload(payload: str | None) -> int | None:
+    """Parse Telegram's short start payload without accepting arbitrary data."""
+    if not payload or len(payload) > 64:
+        return None
+    match = re.fullmatch(r"join_([1-9][0-9]*)", payload)
+    if match is None:
+        return None
+    game_id = int(match.group(1))
+    return game_id if game_id <= 2**63 - 1 else None
 
-def lobby_keyboard(chat_id: int):
-    return build_lobby_keyboard(chat_id)
+
+def calculate_game_reward_amounts(
+    participant_ids: set[int],
+    first_winner_id: int | None,
+    second_winner_id: int | None,
+) -> dict[int, int]:
+    winners = {
+        user_id
+        for user_id in (first_winner_id, second_winner_id)
+        if user_id is not None
+    }
+    if not participant_ids or not winners or not winners.issubset(participant_ids):
+        raise ValueError("Game reward participant set is invalid")
+    return {
+        user_id: (30 if user_id in winners else 15)
+        for user_id in participant_ids
+    }
+
+
+
+def lobby_keyboard(lobby: Lobby):
+    if lobby.game_id is None or not lobby.bot_username:
+        raise ValueError("Lobby deep-link data is missing")
+    return build_lobby_keyboard(lobby.bot_username, lobby.game_id, lobby.chat_id)
 
 
 def lobby_text(lobby: Lobby) -> str:
@@ -531,7 +630,8 @@ def lobby_text(lobby: Lobby) -> str:
     )
 
 
-@router.message(Command("bunker"))
+@router.message(Command("bunker", "game"))
+@_serialize_lobby_creation
 async def create_lobby(message: Message):
     if message.chat.type not in ("group", "supergroup"):
         await message.answer(
@@ -542,13 +642,6 @@ async def create_lobby(message: Message):
 
     chat_id = message.chat.id
 
-    if chat_id in lobbies and not lobbies[chat_id].finished:
-        await message.answer(
-            texts.error_text("Bu guruhda xona allaqachon ochilgan."),
-            parse_mode="HTML",
-        )
-        return
-
     host = message.from_user
     if host is None:
         await message.answer(
@@ -557,30 +650,105 @@ async def create_lobby(message: Message):
         )
         return
 
-    lobby = Lobby(
-        chat_id=chat_id,
-        host_id=host.id,
-        players={host.id: host.full_name},
-        usernames={host.id: host.username},
-    )
+    try:
+        bot_info = await message.bot.get_me()
+    except TelegramAPIError as error:
+        logger.warning(
+            "Lobby yaratish uchun bot username olinmadi: error_type=%s",
+            type(error).__name__,
+        )
+        await message.answer(
+            texts.error_text("O‘yin havolasini tayyorlab bo‘lmadi. Keyinroq urinib ko‘ring."),
+            parse_mode="HTML",
+        )
+        return
+    if not bot_info.username:
+        await message.answer(
+            texts.error_text("Bot username sozlanmagan, o‘yin havolasini yaratib bo‘lmadi."),
+            parse_mode="HTML",
+        )
+        return
 
     game_id: int | None = None
+    previous_message_id: int | None = None
+    expected_message_id: int | None = None
     blocked = False
+    game_started = False
+    is_new_game = False
+    lobby: Lobby | None = None
     try:
         async with get_sessionmaker()() as session:
             async with session.begin():
                 await lock_user_for_block_check(session, host.id)
                 blocked = await is_user_blocked(session, host.id)
                 if not blocked:
-                    existing_game_id = await session.scalar(
-                        select(Game.id)
+                    game = await session.scalar(
+                        select(Game)
                         .where(
                             Game.chat_id == chat_id,
                             Game.status.in_(("lobby", "active")),
                         )
+                        .with_for_update()
                         .limit(1)
                     )
-                    if existing_game_id is None:
+                    if game is not None and game.status == "active":
+                        game_started = True
+                    elif game is not None:
+                        game_id = game.id
+                        previous_message_id = game.lobby_message_id
+                        expected_message_id = game.lobby_message_id
+                        player_rows = list(
+                            (
+                                await session.scalars(
+                                    select(GamePlayer)
+                                    .where(GamePlayer.game_id == game.id)
+                                    .order_by(GamePlayer.id)
+                                )
+                            ).all()
+                        )
+                        current_lobby = lobbies.get(chat_id)
+                        if (
+                            current_lobby is not None
+                            and current_lobby.game_id == game.id
+                            and not current_lobby.started
+                            and not current_lobby.finished
+                        ):
+                            lobby = current_lobby
+                            lobby.message_id = game.lobby_message_id
+                            lobby.players = {
+                                player.telegram_user_id: player.name
+                                for player in player_rows
+                            }
+                            lobby.usernames = {
+                                player.telegram_user_id: player.username
+                                for player in player_rows
+                            }
+                        else:
+                            lobby = Lobby(
+                                chat_id=chat_id,
+                                host_id=game.host_telegram_id,
+                                game_id=game.id,
+                                bot_username=bot_info.username,
+                                players={
+                                    player.telegram_user_id: player.name
+                                    for player in player_rows
+                                },
+                                usernames={
+                                    player.telegram_user_id: player.username
+                                    for player in player_rows
+                                },
+                                message_id=game.lobby_message_id,
+                            )
+                    else:
+                        previous_message_id = await session.scalar(
+                            select(Game.lobby_message_id)
+                            .where(
+                                Game.chat_id == chat_id,
+                                Game.lobby_message_id.is_not(None),
+                            )
+                            .order_by(Game.id.desc())
+                            .limit(1)
+                        )
                         game = Game(
                             chat_id=chat_id,
                             host_telegram_id=host.id,
@@ -599,6 +767,16 @@ async def create_lobby(message: Message):
                         )
                         await session.flush()
                         game_id = game.id
+                        is_new_game = True
+                        expected_message_id = None
+                        lobby = Lobby(
+                            chat_id=chat_id,
+                            host_id=host.id,
+                            game_id=game.id,
+                            bot_username=bot_info.username,
+                            players={host.id: host.full_name},
+                            usernames={host.id: host.username},
+                        )
     except IntegrityError as error:
         if (
             _integrity_constraint_name(error)
@@ -637,6 +815,13 @@ async def create_lobby(message: Message):
         )
         return
 
+    if game_started:
+        await message.answer(
+            texts.error_text("Bu guruhdagi o‘yin allaqachon boshlangan; yangi ro‘yxatdan o‘tish posti yuborilmadi."),
+            parse_mode="HTML",
+        )
+        return
+
     if game_id is None:
         await message.answer(
             texts.error_text("Bu guruhda allaqachon faol o‘yin mavjud."),
@@ -644,130 +829,267 @@ async def create_lobby(message: Message):
         )
         return
 
-    lobbies[chat_id] = lobby
-    sent = await message.answer(
-        lobby_text(lobby),
-        reply_markup=lobby_keyboard(chat_id),
-        parse_mode="HTML",
-    )
-    lobby.message_id = sent.message_id
-
-    try:
-        async with get_sessionmaker()() as session:
-            async with session.begin():
-                await session.execute(
-                    update(Game)
-                    .where(Game.id == game_id)
-                    .values(lobby_message_id=sent.message_id)
-                )
-    except (SQLAlchemyError, RuntimeError) as error:
-        logger.error(
-            "Lobby xabar ID sini saqlashda DB xatosi (%s)",
-            type(error).__name__,
-        )
+    if lobby is None:
         await message.answer(
-            texts.error_text(
-                "Xona yaratildi, ammo lobby xabar ID sini bazaga saqlab bo‘lmadi."
-            ),
+            texts.error_text("Lobby ma’lumotlarini tiklab bo‘lmadi. Admin bilan bog‘laning."),
             parse_mode="HTML",
         )
+        return
+
+    # Keep a recovered active lobby usable if publishing its replacement fails.
+    if not is_new_game:
+        lobbies[chat_id] = lobby
+
+    sent = None
+    try:
+        sent = await message.answer(
+            lobby_text(lobby),
+            reply_markup=lobby_keyboard(lobby),
+            parse_mode="HTML",
+        )
+        await sent.pin(disable_notification=True)
+        async with get_sessionmaker()() as session:
+            async with session.begin():
+                result = await session.execute(
+                    update(Game)
+                    .where(
+                        Game.id == game_id,
+                        Game.status == "lobby",
+                        (
+                            Game.lobby_message_id.is_(None)
+                            if expected_message_id is None
+                            else Game.lobby_message_id == expected_message_id
+                        ),
+                    )
+                    .values(lobby_message_id=sent.message_id)
+                )
+                if result.rowcount != 1:
+                    raise RuntimeError("Lobby message changed during publication")
+    except (TelegramAPIError, SQLAlchemyError, RuntimeError) as error:
+        logger.error(
+            "Lobby xabarini yuborish/pin qilishda xato: game_id=%s, error_type=%s",
+            game_id,
+            type(error).__name__,
+        )
+        cancel_status = "not_new_game"
+        if is_new_game:
+            cancel_status, _ = await cancel_open_game(game_id=game_id)
+            if lobbies.get(chat_id) is lobby:
+                lobbies.pop(chat_id, None)
+        if sent is not None:
+            try:
+                if isinstance(error, (SQLAlchemyError, RuntimeError)):
+                    await sent.unpin()
+                await sent.delete()
+            except TelegramAPIError as cleanup_error:
+                logger.info(
+                    "Yangi lobby xabarini tozalab bo‘lmadi: error_type=%s",
+                    type(cleanup_error).__name__,
+                )
+        if cancel_status == "error":
+            detail = (
+                "O‘yin xabarini yuborib/pin qilib bo‘lmadi va bazadagi lobby "
+                "holatini bekor qilish ham muvaffaqiyatsiz tugadi. Admin bilan bog‘laning."
+            )
+        elif isinstance(error, TelegramAPIError) and sent is not None:
+            detail = (
+                "O‘yin lobby xabarini pin qilib bo‘lmadi. Botga guruhda "
+                "xabarlarni pin qilish huquqini bering va /game ni qayta yuboring."
+            )
+        elif isinstance(error, TelegramAPIError):
+            detail = (
+                "Bot guruhga lobby xabarini yubora olmadi. Botning guruhga xabar "
+                "yuborish huquqini tekshirib, /game ni qayta yuboring."
+            )
+        else:
+            detail = (
+                "Yangi ro‘yxatdan o‘tish xabarini saqlab bo‘lmadi. Avvalgi lobby posti "
+                "saqlandi; birozdan keyin /game ni qayta yuboring."
+            )
+        await message.answer(
+            texts.error_text(detail),
+            parse_mode="HTML",
+        )
+        return
+
+    lobby.message_id = sent.message_id
+    lobbies[chat_id] = lobby
+    if previous_message_id is not None and previous_message_id != sent.message_id:
+        try:
+            await message.bot.delete_message(
+                chat_id=chat_id,
+                message_id=previous_message_id,
+            )
+        except TelegramBadRequest as error:
+            description = getattr(error, "message", "").casefold()
+            if "message to delete not found" in description:
+                logger.info(
+                    "Oldingi lobby xabari avvaldan o‘chirilgan: chat_id=%s",
+                    chat_id,
+                )
+                return
+            logger.info(
+                "Oldingi lobby xabarini o‘chirib bo‘lmadi: chat_id=%s, error_type=%s",
+                chat_id,
+                type(error).__name__,
+            )
+            await message.answer(
+                "✅ Yangi lobby xabari pin qilindi va saqlandi. Eski xabarni o‘chirish uchun "
+                "botga guruhda xabarlarni o‘chirish huquqini bering.",
+            )
+        except TelegramAPIError as error:
+            logger.info(
+                "Oldingi lobby xabari o‘chmadi: chat_id=%s, error_type=%s",
+                chat_id,
+                type(error).__name__,
+            )
+            await message.answer(
+                "✅ Yangi lobby xabari pin qilindi. Eski bot xabarini o‘chirish uchun "
+                "botga guruhda xabarlarni o‘chirish huquqini bering.",
+            )
 
 
-@router.callback_query(F.data.startswith("bunker:join:"))
-async def join_lobby(callback: CallbackQuery):
-    chat_id = int(callback.data.rsplit(":", 1)[1])
-    lobby = lobbies.get(chat_id)
-
+async def join_lobby_by_game_id(game_id: int, user) -> tuple[str, Lobby | None]:
+    """Join through the same locked, validated lobby path for buttons and deep links."""
+    lobby = next(
+        (candidate for candidate in lobbies.values() if candidate.game_id == game_id),
+        None,
+    )
     if lobby is None or lobby.started or lobby.finished:
-        await callback.answer("⚠️ Bu xona faol emas.", show_alert=True)
-        return
-
-    user = callback.from_user
-
-    if user.id in lobby.players:
-        await callback.answer("ℹ️ Siz allaqachon xonadasiz.")
-        return
-
-    if len(lobby.players) >= MAX_PLAYERS:
-        await callback.answer("🚫 Xona to‘lib bo‘lgan.", show_alert=True)
-        return
+        return "unavailable", lobby
 
     try:
         async with get_sessionmaker()() as session:
             async with session.begin():
                 await lock_user_for_block_check(session, user.id)
                 if await is_user_blocked(session, user.id):
-                    await callback.answer(
-                        "🚫 Sizga o‘yinga qo‘shilish cheklangan.",
-                        show_alert=True,
-                    )
-                    return
+                    return "blocked", lobby
 
-                game_id = await session.scalar(
-                    select(Game.id).where(
-                        Game.chat_id == chat_id,
-                        Game.status == "lobby",
+                game = await session.scalar(
+                    select(Game)
+                    .where(Game.id == game_id, Game.status == "lobby")
+                    .with_for_update()
+                )
+                if game is None or game.chat_id != lobby.chat_id:
+                    return "unavailable", lobby
+
+                player_ids = set(
+                    (
+                        await session.scalars(
+                            select(GamePlayer.telegram_user_id).where(
+                                GamePlayer.game_id == game_id
+                            )
+                        )
+                    ).all()
+                )
+                if user.id in player_ids:
+                    return "already_joined", lobby
+                if len(player_ids) >= MAX_PLAYERS:
+                    return "full", lobby
+
+                session.add(
+                    GamePlayer(
+                        game_id=game_id,
+                        telegram_user_id=user.id,
+                        name=user.full_name,
+                        username=user.username,
+                        status="active",
                     )
                 )
-
-                if game_id is not None:
-                    session.add(
-                        GamePlayer(
-                            game_id=game_id,
-                            telegram_user_id=user.id,
-                            name=user.full_name,
-                            username=user.username,
-                            status="active",
-                        )
-                    )
-                    await session.flush()
+                await session.flush()
     except IntegrityError as error:
-        if (
-            _integrity_constraint_name(error)
-            == "uq_game_players_game_user"
-        ):
-            await callback.answer(
-                "ℹ️ Siz allaqachon xonadasiz.",
-                show_alert=True,
-            )
-            return
-
+        if _integrity_constraint_name(error) == "uq_game_players_game_user":
+            return "already_joined", lobby
         logger.error(
-            "Lobbyga qo‘shishda DB integrity xatosi (%s)",
+            "Lobbyga qo‘shishda DB integrity xatosi: error_type=%s",
             type(error.orig).__name__,
         )
-        await callback.answer(
-            "⚠️ Bazaga qo‘shilmadi. Birozdan keyin qayta urinib ko‘ring.",
-            show_alert=True,
-        )
-        return
+        return "error", lobby
     except (SQLAlchemyError, RuntimeError) as error:
         logger.error(
-            "Lobbyga qo‘shishda DB xatosi (%s)",
+            "Lobbyga qo‘shishda DB xatosi: error_type=%s",
             type(error).__name__,
         )
-        await callback.answer(
-            "⚠️ Bazaga qo‘shilmadi. Birozdan keyin qayta urinib ko‘ring.",
-            show_alert=True,
-        )
-        return
-
-    if game_id is None:
-        await callback.answer(
-            "⚠️ Bu xona bazada faol emas. Yangi xona yarating.",
-            show_alert=True,
-        )
-        return
+        return "error", lobby
 
     lobby.players[user.id] = user.full_name
     lobby.usernames[user.id] = user.username
+    return "joined", lobby
 
-    await callback.message.edit_text(
-        lobby_text(lobby),
-        reply_markup=lobby_keyboard(chat_id),
-        parse_mode="HTML",
-    )
-    await callback.answer("✅ Xonaga qo‘shildingiz!")
+
+async def refresh_lobby_message(bot, lobby: Lobby) -> bool:
+    if lobby.message_id is None:
+        return False
+    try:
+        await bot.edit_message_text(
+            chat_id=lobby.chat_id,
+            message_id=lobby.message_id,
+            text=lobby_text(lobby),
+            reply_markup=lobby_keyboard(lobby),
+            parse_mode="HTML",
+        )
+        return True
+    except TelegramAPIError as error:
+        logger.info(
+            "Lobby xabarini yangilab bo‘lmadi: game_id=%s, error_type=%s",
+            lobby.game_id,
+            type(error).__name__,
+        )
+        return False
+
+
+async def process_join_deep_link(message: Message, payload: str) -> None:
+    game_id = parse_join_game_payload(payload)
+    if game_id is None:
+        await message.answer(
+            "⚠️ O‘yin havolasi noto‘g‘ri yoki eskirgan. Guruhdagi yangi havoladan foydalaning."
+        )
+        return
+    if message.chat.type != "private":
+        await message.answer("O‘yinga qo‘shilish uchun bot bilan shaxsiy chatni oching.")
+        return
+    if message.from_user is None:
+        await message.answer("Foydalanuvchi aniqlanmadi. Botga shaxsiy chatdan /start yuboring.")
+        return
+
+    status, lobby = await join_lobby_by_game_id(game_id, message.from_user)
+    if status == "joined" and lobby is not None:
+        await refresh_lobby_message(message.bot, lobby)
+        await message.answer("✅ Guruh o‘yiniga qo‘shildingiz! Lobby tafsilotlari guruhda.")
+    elif status == "already_joined":
+        await message.answer("ℹ️ Siz bu o‘yinga allaqachon qo‘shilgansiz.")
+    elif status == "full":
+        await message.answer("🚫 Bu lobby to‘lib bo‘lgan.")
+    elif status == "blocked":
+        await message.answer("🚫 Sizga o‘yinga qo‘shilish cheklangan.")
+    elif status == "unavailable":
+        await message.answer("⚠️ Bu o‘yin topilmadi yoki ro‘yxatdan o‘tish yopilgan.")
+    else:
+        await message.answer("⚠️ O‘yinga hozir qo‘shib bo‘lmadi. Birozdan keyin urinib ko‘ring.")
+
+
+@router.callback_query(F.data.startswith("bunker:join:"))
+async def join_lobby(callback: CallbackQuery):
+    chat_id = int(callback.data.rsplit(":", 1)[1])
+    lobby = lobbies.get(chat_id)
+    if lobby is None or lobby.game_id is None:
+        await callback.answer("⚠️ Bu xona faol emas.", show_alert=True)
+        return
+
+    status, lobby = await join_lobby_by_game_id(lobby.game_id, callback.from_user)
+    if status == "joined" and lobby is not None:
+        await refresh_lobby_message(callback.bot, lobby)
+        await callback.answer("✅ Xonaga qo‘shildingiz!")
+    elif status == "already_joined":
+        await callback.answer("ℹ️ Siz allaqachon xonadasiz.")
+    elif status == "full":
+        await callback.answer("🚫 Xona to‘lib bo‘lgan.", show_alert=True)
+    elif status == "blocked":
+        await callback.answer("🚫 Sizga o‘yinga qo‘shilish cheklangan.", show_alert=True)
+    elif status == "unavailable":
+        await callback.answer("⚠️ Bu xona faol emas yoki ro‘yxatdan o‘tish yopilgan.", show_alert=True)
+    else:
+        await callback.answer("⚠️ Bazaga qo‘shilmadi. Birozdan keyin qayta urinib ko‘ring.", show_alert=True)
 
 
 async def cancel_open_game(
@@ -881,6 +1203,20 @@ async def cancel_lobby(message: Message):
         )
 
 
+async def is_current_group_admin(bot, chat_id: int, user_id: int) -> bool | None:
+    """Return None if Telegram could not verify, otherwise current admin status."""
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+    except TelegramAPIError as error:
+        logger.warning(
+            "Guruh adminligini tekshirib bo‘lmadi: chat_id=%s, error_type=%s",
+            chat_id,
+            type(error).__name__,
+        )
+        return None
+    return member.status in {"creator", "administrator"}
+
+
 @router.callback_query(F.data.startswith("bunker:start:"))
 async def start_lobby(callback: CallbackQuery):
     chat_id = int(callback.data.rsplit(":", 1)[1])
@@ -890,9 +1226,24 @@ async def start_lobby(callback: CallbackQuery):
         await callback.answer("⚠️ Bu xona faol emas.", show_alert=True)
         return
 
-    if callback.from_user.id != lobby.host_id:
+    if not isinstance(callback.message, Message) or callback.message.chat.id != chat_id:
+        await callback.answer("⚠️ Bu tugma tegishli guruh xabari emas.", show_alert=True)
+        return
+
+    is_admin = await is_current_group_admin(
+        callback.bot,
+        chat_id,
+        callback.from_user.id,
+    )
+    if is_admin is None:
         await callback.answer(
-            "⛔ O‘yinni faqat xona tashkilotchisi boshlashi mumkin.",
+            "⚠️ Guruhdagi admin huquqini tekshirib bo‘lmadi. Keyinroq urinib ko‘ring.",
+            show_alert=True,
+        )
+        return
+    if not is_admin:
+        await callback.answer(
+            "⛔ O‘yinni faqat guruh egasi yoki administratori boshlashi mumkin.",
             show_alert=True,
         )
         return
@@ -1095,6 +1446,30 @@ async def show_my_cards(message: Message):
 
 
 
+async def send_card_announcement(
+    bot,
+    chat_id: int,
+    player_name: str,
+    category: str,
+    card_value: str,
+    *,
+    username: str | None = None,
+    automatic: bool = False,
+) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        text=texts.card_announcement_text(
+            player_name,
+            category,
+            card_value,
+            automatic=automatic,
+            username=username,
+        ),
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
 @router.callback_query(F.data.startswith("bunker:reveal:"))
 async def reveal_card(callback: CallbackQuery):
     parts = callback.data.split(":", 3)
@@ -1224,14 +1599,13 @@ async def reveal_card(callback: CallbackQuery):
         parse_mode="HTML",
     )
 
-    await callback.bot.send_message(
-        chat_id=chat_id,
-        text=texts.card_announcement_text(
-            player_name,
-            category,
-            card_value,
-        ),
-        parse_mode="HTML",
+    await send_card_announcement(
+        callback.bot,
+        chat_id,
+        player_name,
+        category,
+        card_value,
+        username=lobby.usernames.get(user_id),
     )
 
     await callback.answer("✅ Karta ochildi!")
@@ -1392,6 +1766,7 @@ async def start_round(chat_id: int, bot):
             ),
         ),
         parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
     eligible_players = {
@@ -1586,12 +1961,17 @@ async def start_voting(chat_id: int, bot):
     if lobby is None or not lobby.started or lobby.finished:
         return
 
+    # Faqat faol o'yinchilar ovoz bera oladi
+    players = dict(lobby.players)
+
+    if len(players) == 2:
+        if not await finish_game_with_two_winners(lobby, bot):
+            lobby.phase = "completion_error"
+        return
+
     if lobby.phase == "voting":
         print("[VOTE] Ovoz berish allaqachon boshlangan", flush=True)
         return
-
-    # Faqat faol o'yinchilar ovoz bera oladi
-    players = dict(lobby.players)
 
     if len(players) < 2:
         await bot.send_message(
@@ -1672,11 +2052,12 @@ async def finish_game_with_two_winners(
         return False
 
     winner_ids = list(lobby.players)
-    if not await _persist_game_completion(
+    rewards = await _persist_game_completion(
         lobby,
         winner_ids[0],
         winner_ids[1],
-    ):
+    )
+    if rewards is None:
         lobby.phase = "completion_error"
         return False
 
@@ -1694,11 +2075,16 @@ async def finish_game_with_two_winners(
     )
     if result_text:
         announcement = f"{result_text}\n\n{announcement}"
+    announcement += "\n\n🪙 <b>O‘yin mukofotlari</b>\n" + "\n".join(
+        f"{escape(lobby.players.get(user_id, str(user_id)))} — <b>+{amount} coin</b>"
+        for user_id, amount in rewards.items()
+    )
 
     await bot.send_message(
         lobby.chat_id,
         announcement,
         parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
     return True
 
@@ -1750,7 +2136,9 @@ async def settle_reveal_round(
             parse_mode="HTML",
         )
 
-    if newly_settled and eliminated_names and len(lobby.players) == 2:
+    if newly_settled and eliminated_names and len(lobby.players) <= 2:
+        if len(lobby.players) < 2:
+            return False
         if not await finish_game_with_two_winners(lobby, bot):
             lobby.phase = "completion_error"
             return True
@@ -1884,15 +2272,14 @@ async def reveal_timer(chat_id: int, bot, round_number: int):
         except Exception as error:
             print(f"[REVEAL] {player_name} ga avtomatik karta yuborilmadi: {error}")
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=texts.card_announcement_text(
-                player_name,
-                category,
-                card_value,
-                automatic=True,
-            ),
-            parse_mode="HTML",
+        await send_card_announcement(
+            bot,
+            chat_id,
+            player_name,
+            category,
+            card_value,
+            automatic=True,
+            username=lobby.usernames.get(user_id),
         )
 
     await asyncio.sleep(max(0, deadline - loop.time()))
@@ -2071,11 +2458,6 @@ async def start_elimination_confirmation(
 
     target_name = lobby.players.get(target_id, str(target_id))
     target_username = lobby.usernames.get(target_id)
-    profile_url = (
-        f"https://t.me/{target_username.lstrip('@')}"
-        if target_username
-        else f"tg://user?id={target_id}"
-    )
 
     yes_count = 0
     no_count = 0
@@ -2091,12 +2473,13 @@ async def start_elimination_confirmation(
         chat_id=chat_id,
         text=texts.confirmation_text(
             target_name,
-            profile_url,
+            target_username,
             yes_count,
             no_count,
         ),
         reply_markup=keyboard,
         parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
     lobby.confirmation_message_id = confirmation_message.message_id
 
@@ -2190,11 +2573,12 @@ async def finish_elimination_confirmation(
             if lobby.first_winner is not None
             else final_survivor_id
         )
-        if not await _persist_game_completion(
+        rewards = await _persist_game_completion(
             lobby,
             first_winner_id,
             final_survivor_id,
-        ):
+        )
+        if rewards is None:
             lobby.phase = "completion_error"
             return
 
@@ -2215,10 +2599,15 @@ async def finish_elimination_confirmation(
             )
         )
 
+        reward_text = "\n\n🪙 <b>O‘yin mukofotlari</b>\n" + "\n".join(
+            f"{escape(lobby.players.get(user_id, str(user_id)))} — <b>+{amount} coin</b>"
+            for user_id, amount in rewards.items()
+        )
         await bot.send_message(
             chat_id,
-            f"{result_text}\n\n{winners_text}",
+            f"{result_text}\n\n{winners_text}{reward_text}",
             parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         return
 

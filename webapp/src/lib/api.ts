@@ -36,6 +36,30 @@ export interface GiftSendResponse {
   message: string
 }
 
+export interface GiftInventoryItem {
+  id: number
+  sender_id: number
+  recipient_id: number
+  sender_name: string
+  recipient_name: string
+  gift_name: string
+  image_emoji: string
+  received_at: string
+  original_price_coins: number
+  resale_price_coins: number
+  sold_at: string | null
+  status: 'owned' | 'sold'
+}
+
+export interface GiftInventoryResponse {
+  items: GiftInventoryItem[]
+}
+
+export interface GiftInventorySellResponse {
+  item: GiftInventoryItem
+  balance_coins: number
+}
+
 export interface CatalogDiagnostics {
   status: number | null
   itemCount: number | null
@@ -80,7 +104,7 @@ export function getSafeCatalogErrorSummary(error: unknown): string {
   return 'Katalog so‘rovini bajarib bo‘lmadi.'
 }
 
-export type Tab = 'home' | 'shop' | 'history'
+export type Tab = 'home' | 'shop' | 'history' | 'inventory'
 
 interface ApiErrorBody {
   detail?: unknown
@@ -184,6 +208,18 @@ export function sendGift(
       idempotency_key: idempotencyKey,
     }),
   })
+}
+
+export function fetchGiftInventory(initData: string) {
+  return request<GiftInventoryResponse>('/api/gifts/inventory', initData)
+}
+
+export function sellGiftInventoryItem(initData: string, inventoryId: number) {
+  return request<GiftInventorySellResponse>(
+    `/api/gifts/inventory/${inventoryId}/sell`,
+    initData,
+    { method: 'POST' },
+  )
 }
 
 function idempotencyStorageKey(telegramUserId: number, shopItemId: number) {

@@ -6,13 +6,15 @@ import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
+from aiogram.filters.command import CommandObject
 from aiogram.types import CallbackQuery, Message
-from dotenv import load_dotenv
+from aiogram.types import ChatJoinRequest, ChatMemberUpdated
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import aliased
 
 from database.engine import close_engine, get_sessionmaker
+from config import get_bot_token, load_project_env
 from database.models import Game, GamePlayer, Para, ParaMember
 from handlers.admin import (
     admin_router,
@@ -20,8 +22,18 @@ from handlers.admin import (
     stop_broadcast_on_shutdown,
 )
 from handlers.admin_shop import router as admin_shop_router
+from handlers.coin_transfer import router as coin_transfer_router
 from handlers.group_command_cleanup import GroupCommandCleanupMiddleware
-from handlers.lobby import router as lobby_router
+from handlers.mandatory_join import (
+    MandatoryJoinMiddleware,
+    check_membership_callback,
+    process_chat_member_update,
+    process_join_request_update,
+)
+from handlers.lobby import (
+    process_join_deep_link,
+    router as lobby_router,
+)
 from handlers.para import router as para_router
 from handlers.payments import router as payments_router
 from handlers.shop import router as shop_router
@@ -34,15 +46,11 @@ from ui.start_menu import (
     profile_text,
 )
 from ui.texts import para_gifts_unconfigured_text
+from telegram_runtime import start_polling, verify_bot_identity
 
 
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN .env faylida topilmadi!")
+load_project_env()
+BOT_TOKEN = get_bot_token(prefer_project_env=True)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -55,6 +63,7 @@ for command_router in (
     shop_router,
     payments_router,
     admin_shop_router,
+    coin_transfer_router,
     lobby_router,
     admin_router,
 ):
@@ -64,13 +73,22 @@ dp.include_router(para_router)
 dp.include_router(shop_router)
 dp.include_router(payments_router)
 dp.include_router(admin_shop_router)
+dp.include_router(coin_transfer_router)
 dp.include_router(lobby_router)
 dp.include_router(admin_router)
 dp.message.outer_middleware(command_cleanup)
 dp.shutdown.register(stop_broadcast_on_shutdown)
+join_gate = MandatoryJoinMiddleware()
+dp.message.outer_middleware(join_gate)
+dp.callback_query.outer_middleware(join_gate)
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, command: CommandObject):
+    args = command.args
+    if args and args.startswith("join_"):
+        await process_join_deep_link(message, args)
+        return
+
     bot_info = await bot.get_me()
     if not bot_info.username:
         raise RuntimeError("Bot username Telegram API tomonidan qaytarilmadi.")
@@ -83,6 +101,36 @@ async def cmd_start(message: Message):
         ),
         parse_mode="HTML",
     )
+
+
+@dp.chat_join_request()
+async def verify_join_request(request: ChatJoinRequest) -> None:
+    try:
+        is_configured = await process_join_request_update(request)
+    except (SQLAlchemyError, RuntimeError) as error:
+        logging.error("Join request verification failed: error_type=%s", type(error).__name__)
+        return
+    if is_configured:
+        try:
+            await request.bot.send_message(
+                request.from_user.id,
+                "📨 A’zolik so‘rovingiz yuborildi. Admin tasdiqlagach, botda a’zolikni tekshiring.",
+            )
+        except TelegramAPIError:
+            logging.info("Join request pending notification could not be delivered")
+
+
+@dp.chat_member()
+async def verify_chat_membership(update: ChatMemberUpdated) -> None:
+    try:
+        await process_chat_member_update(update)
+    except (SQLAlchemyError, RuntimeError) as error:
+        logging.error("Chat membership update failed: error_type=%s", type(error).__name__)
+
+
+@dp.callback_query(F.data == "join:check")
+async def recheck_membership(callback: CallbackQuery) -> None:
+    await check_membership_callback(callback)
 
 
 @dp.callback_query(F.data == "menu:guide")
@@ -275,8 +323,9 @@ async def _get_profile_data(
 async def main():
     try:
         get_admin_ids()
+        await verify_bot_identity(bot)
         print("Bunker TG ishga tushmoqda...")
-        await dp.start_polling(bot)
+        await start_polling(dp, bot)
     finally:
         try:
             await bot.session.close()

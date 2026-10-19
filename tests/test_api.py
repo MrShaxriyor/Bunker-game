@@ -18,6 +18,7 @@ from api.auth import verify_init_data
 from api.main import create_app, get_db_session
 from database.models import (
     ParaGift,
+    ParaGiftInventory,
     WalletTransaction,
 )
 
@@ -62,6 +63,10 @@ class _FakeState:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.wallet = SimpleNamespace(telegram_user_id=101, balance_coins=100)
+        self.wallets = {
+            101: self.wallet,
+            202: SimpleNamespace(telegram_user_id=202, balance_coins=0),
+        }
         self.para = SimpleNamespace(
             id=71,
             proposer_id=101,
@@ -94,6 +99,7 @@ class _FakeState:
         )
         self.catalog_items = []
         self.gifts = []
+        self.inventory = []
         self.transactions = []
         self.fail_flush = False
 
@@ -107,8 +113,9 @@ class _FakeTransaction:
         state = self.session.state
         await state.lock.acquire()
         self.snapshot = (
-            state.wallet.balance_coins,
+            {user_id: wallet.balance_coins for user_id, wallet in state.wallets.items()},
             list(state.gifts),
+            [(item, item.sold_at, item.resale_price_coins) for item in state.inventory],
             list(state.transactions),
         )
         return self
@@ -116,10 +123,18 @@ class _FakeTransaction:
     async def __aexit__(self, exc_type, *_):
         if exc_type is not None:
             (
-                self.session.state.wallet.balance_coins,
+                balances,
                 self.session.state.gifts,
+                inventory,
                 self.session.state.transactions,
             ) = self.snapshot
+            for user_id, wallet in self.session.state.wallets.items():
+                if user_id in balances:
+                    wallet.balance_coins = balances[user_id]
+            self.session.state.inventory = [item for item, _, _ in inventory]
+            for item, sold_at, resale_price in inventory:
+                item.sold_at = sold_at
+                item.resale_price_coins = resale_price
         self.session.state.lock.release()
         return False
 
@@ -133,15 +148,48 @@ class _FakeSession:
         return _FakeTransaction(self)
 
     async def execute(self, _statement):
-        del _statement
+        sql = str(_statement.compile(dialect=postgresql.dialect()))
+        if "INSERT INTO player_wallets" in sql:
+            user_id = _statement.compile(dialect=postgresql.dialect()).params.get(
+                "telegram_user_id"
+            )
+            self.state.wallets.setdefault(
+                user_id,
+                SimpleNamespace(telegram_user_id=user_id, balance_coins=0),
+            )
         return _FakeResult()
 
     async def scalar(self, statement):
         sql = str(statement.compile(dialect=postgresql.dialect()))
         if "FROM player_wallets" in sql:
+            user_id = statement.compile(dialect=postgresql.dialect()).params.get(
+                "telegram_user_id_1"
+            )
+            wallet = self.state.wallets.get(user_id)
             if "SELECT player_wallets.balance_coins" in sql:
-                return self.state.wallet.balance_coins
-            return self.state.wallet
+                return wallet.balance_coins if wallet is not None else None
+            return wallet
+        if "FROM para_gift_inventory" in sql:
+            params = statement.compile(dialect=postgresql.dialect()).params
+            inventory_id = params.get("id_1")
+            owner_id = params.get("owner_id_1")
+            return next(
+                (
+                    item
+                    for item in self.state.inventory
+                    if (inventory_id is None or item.id == inventory_id)
+                    and (owner_id is None or item.owner_id == owner_id)
+                ),
+                None,
+            )
+        if "FROM wallet_transactions" in sql:
+            key = statement.compile(dialect=postgresql.dialect()).params.get(
+                "idempotency_key_1"
+            )
+            return next(
+                (item for item in self.state.transactions if item.idempotency_key == key),
+                None,
+            )
         if "FROM para_gifts" in sql:
             key = sql.split("para_gifts.idempotency_key =", 1)
             if len(key) > 1:
@@ -212,10 +260,20 @@ class _FakeSession:
             ]
             rows.sort(key=lambda gift: (gift.created_at, gift.id), reverse=True)
             return _FakeResult(rows)
+        if "FROM para_gift_inventory" in sql:
+            owner_id = statement.compile(dialect=postgresql.dialect()).params.get(
+                "owner_id_1"
+            )
+            rows = [item for item in self.state.inventory if item.owner_id == owner_id]
+            rows.sort(key=lambda item: (item.received_at, item.id), reverse=True)
+            return _FakeResult(rows)
         return _FakeResult()
 
     def add_all(self, items):
         self.pending.extend(items)
+
+    def add(self, item):
+        self.pending.append(item)
 
     async def flush(self):
         if self.state.fail_flush:
@@ -226,6 +284,11 @@ class _FakeSession:
                 if item.created_at is None:
                     item.created_at = datetime.now(timezone.utc)
                 self.state.gifts.append(item)
+            elif isinstance(item, ParaGiftInventory):
+                item.id = 901 + len(self.state.inventory)
+                if item.received_at is None:
+                    item.received_at = datetime.now(timezone.utc)
+                self.state.inventory.append(item)
             elif isinstance(item, WalletTransaction):
                 item.id = 801 + len(self.state.transactions)
                 self.state.transactions.append(item)
@@ -472,6 +535,110 @@ class ParaGiftsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.state.gifts), 1)
         self.assertEqual(self.state.gifts[0].recipient_id, 202)
         self.assertEqual(self.state.gifts[0].gift_name_snapshot, "Rose")
+        self.assertEqual(len(self.state.inventory), 1)
+        self.assertEqual(self.state.inventory[0].owner_id, 202)
+        self.assertEqual(self.state.inventory[0].image_emoji_snapshot, "🎁")
+
+    def _inventory_item(self, *, price=300):
+        return ParaGiftInventory(
+            id=77,
+            para_gift_id=501,
+            owner_id=202,
+            sender_id=101,
+            recipient_id=202,
+            sender_name_snapshot="Sender",
+            recipient_name_snapshot="Partner",
+            shop_item_id=9,
+            gift_name_snapshot="🌹 Rose",
+            image_emoji_snapshot="🌹",
+            original_price_coins=price,
+            received_at=datetime.now(timezone.utc),
+            sold_at=None,
+            resale_price_coins=None,
+        )
+
+    async def test_inventory_is_user_scoped_and_shows_complete_gift_details(self):
+        self.state.inventory.append(self._inventory_item())
+
+        response = await self.client.get(
+            "/api/gifts/inventory",
+            headers=self.auth_headers(202),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        record = response.json()["items"][0]
+        self.assertEqual(record["gift_name"], "🌹 Rose")
+        self.assertEqual(record["sender_id"], 101)
+        self.assertEqual(record["recipient_id"], 202)
+        self.assertEqual(record["sender_name"], "Sender")
+        self.assertEqual(record["recipient_name"], "Partner")
+        self.assertEqual(record["original_price_coins"], 300)
+        self.assertEqual(record["resale_price_coins"], 150)
+        self.assertEqual(record["status"], "owned")
+
+        other_user_detail = await self.client.get(
+            "/api/gifts/inventory/77",
+            headers=self.auth_headers(101),
+        )
+        self.assertEqual(other_user_detail.status_code, 404)
+
+    async def test_inventory_sale_credits_half_price_once_and_keeps_history(self):
+        item = self._inventory_item()
+        self.state.inventory.append(item)
+
+        first = await self.client.post(
+            "/api/gifts/inventory/77/sell",
+            headers=self.auth_headers(202),
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["balance_coins"], 150)
+        self.assertEqual(first.json()["item"]["resale_price_coins"], 150)
+        self.assertEqual(first.json()["item"]["status"], "sold")
+        self.assertIsNotNone(item.sold_at)
+        self.assertEqual(self.state.wallets[202].balance_coins, 150)
+        self.assertEqual(len(self.state.transactions), 1)
+        self.assertEqual(self.state.transactions[0].reason, "gift_resale")
+        self.assertEqual(len(self.state.inventory), 1)
+
+        second = await self.client.post(
+            "/api/gifts/inventory/77/sell",
+            headers=self.auth_headers(202),
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(self.state.wallets[202].balance_coins, 150)
+        self.assertEqual(len(self.state.transactions), 1)
+
+    async def test_parallel_sale_requests_cannot_credit_twice(self):
+        self.state.inventory.append(self._inventory_item(price=301))
+        first, second = await asyncio.gather(
+            self.client.post(
+                "/api/gifts/inventory/77/sell",
+                headers=self.auth_headers(202),
+            ),
+            self.client.post(
+                "/api/gifts/inventory/77/sell",
+                headers=self.auth_headers(202),
+            ),
+        )
+        self.assertEqual(sorted([first.status_code, second.status_code]), [200, 409])
+        self.assertEqual(self.state.wallets[202].balance_coins, 150)
+        self.assertEqual(self.state.inventory[0].resale_price_coins, 150)
+        self.assertEqual(len(self.state.transactions), 1)
+
+    async def test_sale_database_failure_rolls_back_item_balance_and_ledger(self):
+        item = self._inventory_item()
+        self.state.inventory.append(item)
+        self.state.fail_flush = True
+
+        response = await self.client.post(
+            "/api/gifts/inventory/77/sell",
+            headers=self.auth_headers(202),
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIsNone(item.sold_at)
+        self.assertEqual(item.resale_price_coins, None)
+        self.assertEqual(self.state.wallets[202].balance_coins, 0)
+        self.assertEqual(self.state.transactions, [])
+        self.assertEqual(len(self.state.inventory), 1)
 
     async def test_repeated_key_replays_and_conflicting_reuse_is_rejected(self):
         body = {"shop_item_id": 9, "idempotency_key": "repeat"}
@@ -490,6 +657,7 @@ class ParaGiftsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second.json()["replayed"])
         self.assertEqual(self.state.wallet.balance_coins, 75)
         self.assertEqual(len(self.state.gifts), 1)
+        self.assertEqual(len(self.state.inventory), 1)
 
         conflict = await self.client.post(
             "/api/gifts/send",

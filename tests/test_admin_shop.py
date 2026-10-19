@@ -181,6 +181,21 @@ class AdminShopServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(inactive.is_active)
         self.assertEqual((await admin_shop_service.get_shop_item_page()).total, 1)
 
+    async def test_para_gift_admin_listing_and_rename_use_existing_shop_item(self):
+        item = await admin_shop_service.create_shop_item(
+            name="Rose", code="rose", description=None,
+            category="para_gift", price_coins=50,
+        )
+        page = await admin_shop_service.get_para_gift_page()
+        repriced = await admin_shop_service.update_shop_item_price(item.id, 75)
+        renamed = await admin_shop_service.update_shop_item_name(item.id, "Red Rose")
+        inactive = await admin_shop_service.toggle_shop_item(item.id)
+        self.assertEqual(page.total, 1)
+        self.assertEqual(page.entries[0].item_type, "para_gift")
+        self.assertEqual(repriced.price_coins, 75)
+        self.assertEqual(renamed.name, "Red Rose")
+        self.assertFalse(inactive.is_active)
+
     async def test_coin_package_create_edit_and_deactivate(self):
         package = await admin_shop_service.create_coin_package(
             name="Starter",

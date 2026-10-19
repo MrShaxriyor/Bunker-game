@@ -1,7 +1,9 @@
 """Database operations for Para Gifts WebApp endpoints."""
 
 import hashlib
+import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -11,11 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database.models import (
     Para,
     ParaGift,
+    ParaGiftInventory,
     ParaMember,
     PlayerWallet,
     ShopItem,
     WalletTransaction,
 )
+from database.wallet import add_coins_in_session
 
 
 class ActiveParaRequired(Exception):
@@ -34,11 +38,33 @@ class GiftIdempotencyConflict(Exception):
     """The idempotency key has already been used for another send."""
 
 
+class GiftInventoryUnavailable(Exception):
+    """The requested gift copy is not owned by the authenticated user."""
+
+
+class GiftAlreadySold(Exception):
+    """The requested gift copy was already sold."""
+
+
 @dataclass(frozen=True)
 class GiftSendResult:
     gift_id: int
     balance_coins: int
     replayed: bool
+
+
+@dataclass(frozen=True)
+class GiftInventorySellResult:
+    item: ParaGiftInventory
+    balance_coins: int
+
+
+def _gift_image_emoji(name: str) -> str:
+    """Use the catalog's leading emoji as a stable, self-contained artwork."""
+    first_part = name.strip().split(maxsplit=1)[0] if name.strip() else ""
+    if not any(unicodedata.category(character) == "So" for character in first_part):
+        return "🎁"
+    return first_part[:32]
 
 
 async def get_profile(session: AsyncSession, telegram_user_id: int) -> dict:
@@ -116,6 +142,80 @@ async def get_gift_history(
     )
     rows = list(gifts.all())
     return rows[:page_size], len(rows) > page_size
+
+
+async def get_gift_inventory(
+    session: AsyncSession,
+    telegram_user_id: int,
+) -> list[ParaGiftInventory]:
+    items = await session.scalars(
+        select(ParaGiftInventory)
+        .where(ParaGiftInventory.owner_id == telegram_user_id)
+        .order_by(
+            ParaGiftInventory.received_at.desc(),
+            ParaGiftInventory.id.desc(),
+        )
+    )
+    return list(items.all())
+
+
+async def get_gift_inventory_item(
+    session: AsyncSession,
+    telegram_user_id: int,
+    inventory_id: int,
+) -> ParaGiftInventory | None:
+    return await session.scalar(
+        select(ParaGiftInventory).where(
+            ParaGiftInventory.id == inventory_id,
+            ParaGiftInventory.owner_id == telegram_user_id,
+        )
+    )
+
+
+async def sell_gift_inventory_item(
+    session: AsyncSession,
+    telegram_user_id: int,
+    inventory_id: int,
+) -> GiftInventorySellResult:
+    """Sell one owned gift and credit its wallet in the same transaction."""
+    async with session.begin():
+        item = await session.scalar(
+            select(ParaGiftInventory)
+            .where(
+                ParaGiftInventory.id == inventory_id,
+                ParaGiftInventory.owner_id == telegram_user_id,
+            )
+            .with_for_update()
+        )
+        if item is None:
+            raise GiftInventoryUnavailable
+        if item.sold_at is not None:
+            raise GiftAlreadySold
+
+        resale_price = item.original_price_coins // 2
+        item.sold_at = datetime.now(timezone.utc)
+        item.resale_price_coins = resale_price
+        if resale_price:
+            wallet_result = await add_coins_in_session(
+                session,
+                telegram_user_id,
+                resale_price,
+                reason="gift_resale",
+                idempotency_key=f"para-gift-resale:{item.id}",
+                note=f"Resold Para Gift #{item.id}",
+            )
+            balance = wallet_result.balance_coins
+        else:
+            balance = await session.scalar(
+                select(PlayerWallet.balance_coins).where(
+                    PlayerWallet.telegram_user_id == telegram_user_id
+                )
+            ) or 0
+        await session.flush()
+        return GiftInventorySellResult(
+            item=item,
+            balance_coins=balance,
+        )
 
 
 def _wallet_transaction_key(
@@ -246,6 +346,12 @@ async def send_gift(
             if sender is None:
                 raise ActiveParaRequired
             recipient_id = sender.partner_id
+            recipient = next(
+                (member for member in members if member.telegram_user_id == recipient_id),
+                None,
+            )
+            if recipient is None:
+                raise ActiveParaRequired
 
             item = await session.scalar(
                 select(ShopItem)
@@ -283,6 +389,22 @@ async def send_gift(
                 idempotency_key=idempotency_key,
             )
             session.add_all([wallet_transaction, gift])
+            await session.flush()
+            session.add(
+                ParaGiftInventory(
+                    para_gift_id=gift.id,
+                    owner_id=recipient_id,
+                    sender_id=telegram_user_id,
+                    recipient_id=recipient_id,
+                    sender_name_snapshot=sender.display_name,
+                    recipient_name_snapshot=recipient.display_name,
+                    shop_item_id=item.id,
+                    gift_name_snapshot=item.name,
+                    image_emoji_snapshot=_gift_image_emoji(item.name),
+                    original_price_coins=item.price_coins,
+                    received_at=gift.created_at or datetime.now(timezone.utc),
+                )
+            )
             await session.flush()
             return GiftSendResult(
                 gift_id=gift.id,

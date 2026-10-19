@@ -21,6 +21,7 @@ GROUP_COMMANDS = frozenset(
         "shop",
         "inventory",
         "buycoins",
+        "coin",
         "paysupport",
         "admin",
     }

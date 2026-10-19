@@ -15,17 +15,20 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from api.auth import verify_init_data
+from config import get_bot_token, load_project_env
 from api.schemas import (
     CatalogGift,
     CatalogResponse,
     GiftHistoryPage,
     GiftHistoryRecord,
+    GiftInventoryRecord,
+    GiftInventoryResponse,
+    GiftInventorySellResponse,
     GiftSendRequest,
     GiftSendResponse,
     MeResponse,
@@ -33,19 +36,24 @@ from api.schemas import (
 from api.service import (
     ActiveParaRequired,
     GiftIdempotencyConflict,
+    GiftAlreadySold,
     GiftItemUnavailable,
+    GiftInventoryUnavailable,
     InsufficientGiftBalance,
     get_gift_catalog,
     get_gift_history,
+    get_gift_inventory,
+    get_gift_inventory_item,
     get_profile,
     send_gift,
+    sell_gift_inventory_item,
 )
 from database.engine import get_sessionmaker
 from database.engine import close_engine
 
 logger = logging.getLogger(__name__)
 MAX_REQUEST_BODY_BYTES = 16 * 1024
-load_dotenv()
+load_project_env()
 
 
 class RequestBodyLimitMiddleware:
@@ -162,12 +170,13 @@ async def get_authenticated_user_id(
             detail="Valid Telegram WebApp authentication is required.",
         )
 
-    bot_token = os.getenv("BOT_TOKEN")
-    if not bot_token:
+    try:
+        bot_token = get_bot_token()
+    except RuntimeError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authentication is temporarily unavailable.",
-        )
+        ) from None
     try:
         return verify_init_data(init_data, bot_token)
     except ValueError:
@@ -334,6 +343,106 @@ def create_app() -> FastAPI:
             received=False,
             page=page,
             page_size=page_size,
+        )
+
+    def inventory_record(item) -> GiftInventoryRecord:
+        sold = item.sold_at is not None
+        return GiftInventoryRecord(
+            id=item.id,
+            sender_id=item.sender_id,
+            recipient_id=item.recipient_id,
+            sender_name=item.sender_name_snapshot,
+            recipient_name=item.recipient_name_snapshot,
+            gift_name=item.gift_name_snapshot,
+            image_emoji=item.image_emoji_snapshot,
+            received_at=item.received_at,
+            original_price_coins=item.original_price_coins,
+            resale_price_coins=(
+                item.resale_price_coins
+                if sold
+                else item.original_price_coins // 2
+            ),
+            sold_at=item.sold_at,
+            status="sold" if sold else "owned",
+        )
+
+    @app.get("/api/gifts/inventory", response_model=GiftInventoryResponse)
+    async def gift_inventory(
+        telegram_user_id: int = Depends(get_authenticated_user_id),
+        session: AsyncSession = Depends(get_db_session),
+    ) -> GiftInventoryResponse:
+        try:
+            items = await get_gift_inventory(session, telegram_user_id)
+        except SQLAlchemyError as error:
+            logger.error(
+                "Para Gifts API inventory read failed: error_type=%s",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Gift inventory is temporarily unavailable.",
+            ) from None
+        return GiftInventoryResponse(items=[inventory_record(item) for item in items])
+
+    @app.get(
+        "/api/gifts/inventory/{inventory_id}",
+        response_model=GiftInventoryRecord,
+    )
+    async def gift_inventory_detail(
+        inventory_id: int,
+        telegram_user_id: int = Depends(get_authenticated_user_id),
+        session: AsyncSession = Depends(get_db_session),
+    ) -> GiftInventoryRecord:
+        try:
+            item = await get_gift_inventory_item(
+                session,
+                telegram_user_id,
+                inventory_id,
+            )
+        except SQLAlchemyError as error:
+            logger.error(
+                "Para Gifts API inventory detail failed: error_type=%s",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Gift inventory is temporarily unavailable.",
+            ) from None
+        if item is None:
+            raise HTTPException(status_code=404, detail="Gift copy not found.")
+        return inventory_record(item)
+
+    @app.post(
+        "/api/gifts/inventory/{inventory_id}/sell",
+        response_model=GiftInventorySellResponse,
+    )
+    async def sell_inventory_gift(
+        inventory_id: int,
+        telegram_user_id: int = Depends(get_authenticated_user_id),
+        session: AsyncSession = Depends(get_db_session),
+    ) -> GiftInventorySellResponse:
+        try:
+            result = await sell_gift_inventory_item(
+                session,
+                telegram_user_id,
+                inventory_id,
+            )
+        except GiftInventoryUnavailable:
+            raise HTTPException(status_code=404, detail="Gift copy not found.") from None
+        except GiftAlreadySold:
+            raise HTTPException(status_code=409, detail="This gift copy was already sold.") from None
+        except SQLAlchemyError as error:
+            logger.error(
+                "Para Gifts API inventory sale failed: error_type=%s",
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Gift sale is temporarily unavailable.",
+            ) from None
+        return GiftInventorySellResponse(
+            item=inventory_record(result.item),
+            balance_coins=result.balance_coins,
         )
 
     @app.post("/api/gifts/send", response_model=GiftSendResponse)

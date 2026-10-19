@@ -8,6 +8,7 @@ from database.models.game_round import GameRound
 from database.models.player_card import PlayerCard
 from database.models.para import Para
 from database.models.para_gift import ParaGift
+from database.models.para_gift_inventory import ParaGiftInventory
 from database.models.para_member import ParaMember
 from database.models.vote import Vote
 from database.models.coin_package import CoinPackage
@@ -16,6 +17,8 @@ from database.models.player_inventory import PlayerInventory
 from database.models.player_wallet import PlayerWallet
 from database.models.shop_item import ShopItem
 from database.models.wallet_transaction import WalletTransaction
+from database.models.bot_user import BotUser
+from database.models.bot_settings import BotSettings
 
 __all__ = [
     "Base",
@@ -26,6 +29,7 @@ __all__ = [
     "PlayerCard",
     "Para",
     "ParaGift",
+    "ParaGiftInventory",
     "ParaMember",
     "ShopItem",
     "PlayerWallet",
@@ -34,4 +38,6 @@ __all__ = [
     "CoinPackage",
     "PaymentOrder",
     "Vote",
+    "BotUser",
+    "BotSettings",
 ]

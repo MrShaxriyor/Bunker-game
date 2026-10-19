@@ -5,6 +5,8 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
@@ -17,7 +19,7 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
@@ -25,7 +27,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database.blocks import lock_user_for_block_check
 from database.engine import get_sessionmaker
-from database.models import BlockedUser, Game, GamePlayer, GameRound
+from database.models import BlockedUser, BotUser, Game, GamePlayer, GameRound
+from database.community_access import get_join_settings, update_join_settings
 from handlers.lobby import cancel_open_game
 from ui import texts
 from ui.keyboards import (
@@ -93,6 +96,11 @@ class PlayerBlockStates(StatesGroup):
 
 class BroadcastStates(StatesGroup):
     waiting_for_message = State()
+
+
+class MembershipSettingsStates(StatesGroup):
+    waiting_for_chat_id = State()
+    waiting_for_invite_link = State()
 
 
 def parse_admin_ids(value: str | None) -> frozenset[int]:
@@ -392,7 +400,7 @@ async def stop_broadcast_on_shutdown() -> None:
         logger.info("Admin broadcast shutdown vaqtida to‘xtatildi")
 
 
-async def _get_statistics() -> tuple[int, int, int, int, int, int, int]:
+async def _get_statistics() -> tuple[int, int, int, int, int, int, int, int, int]:
     async with get_sessionmaker()() as session:
         game_counts = (
             await session.execute(
@@ -407,8 +415,19 @@ async def _get_statistics() -> tuple[int, int, int, int, int, int, int]:
         ).one()
         unique_players = await session.scalar(
             select(func.count(func.distinct(GamePlayer.telegram_user_id)))
+            .join(Game, Game.id == GamePlayer.game_id)
+            .where(Game.status.in_(("active", "completed")))
         )
         total_rounds = await session.scalar(select(func.count(GameRound.id)))
+        tashkent_day_start = datetime.now(ZoneInfo("Asia/Tashkent")).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).astimezone(timezone.utc)
+        registered_users = await session.scalar(select(func.count(BotUser.telegram_user_id)))
+        registered_today = await session.scalar(
+            select(func.count(BotUser.telegram_user_id)).where(
+                BotUser.registered_at >= tashkent_day_start
+            )
+        )
 
     return (
         game_counts[0],
@@ -418,6 +437,8 @@ async def _get_statistics() -> tuple[int, int, int, int, int, int, int]:
         game_counts[4],
         unique_players or 0,
         total_rounds or 0,
+        registered_users or 0,
+        registered_today or 0,
     )
 
 
@@ -1092,6 +1113,125 @@ async def show_admin_menu(
             parse_mode="HTML",
         )
     await callback.answer()
+
+
+def _membership_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⏸️ Talabni o‘chirish" if enabled else "▶️ Talabni yoqish"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Chat ID sozlash", callback_data="admin:membership:chat")],
+        [InlineKeyboardButton(text="🔗 Join-request havolasi", callback_data="admin:membership:link")],
+        [InlineKeyboardButton(text=toggle_text, callback_data="admin:membership:toggle")],
+        [InlineKeyboardButton(text="⬅️ Admin menyu", callback_data="admin:menu")],
+    ])
+
+
+async def _show_membership_settings(callback: CallbackQuery) -> None:
+    try:
+        settings = await get_join_settings()
+    except (SQLAlchemyError, RuntimeError) as error:
+        logger.error("Join settings read failed: error_type=%s", type(error).__name__)
+        await callback.answer("A’zolik sozlamalarini olib bo‘lmadi.", show_alert=True)
+        return
+    status = "Yoqilgan" if settings.enabled else "O‘chiq"
+    chat = str(settings.chat_id) if settings.chat_id is not None else "sozlanmagan"
+    link = "sozlangan" if settings.invite_link else "sozlanmagan"
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(
+            "🔐 <b>Majburiy a’zolik</b>\n\n"
+            f"Holati: <b>{status}</b>\nChat ID: <code>{chat}</code>\n"
+            f"So‘rov havolasi: <b>{link}</b>\n\n"
+            "Botga guruhda invite users huquqini bering va join-request yaratadigan taklif havolasini kiriting.",
+            reply_markup=_membership_keyboard(settings.enabled),
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "admin:membership", AdminAccessFilter())
+async def show_membership_settings(callback: CallbackQuery) -> None:
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer("Bu sozlamani faqat shaxsiy admin chatida oching.", show_alert=True)
+        return
+    await _show_membership_settings(callback)
+
+
+@admin_router.callback_query(F.data.in_({"admin:membership:chat", "admin:membership:link"}), AdminAccessFilter())
+async def begin_membership_setting(callback: CallbackQuery, state: FSMContext) -> None:
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer("Sozlamani shaxsiy chatda oching.", show_alert=True)
+        return
+    await state.clear()
+    if callback.data == "admin:membership:chat":
+        await state.set_state(MembershipSettingsStates.waiting_for_chat_id)
+        prompt = "Target guruh yoki superguruh chat ID sini yuboring (masalan, -100…); /cancel — bekor qilish."
+    else:
+        await state.set_state(MembershipSettingsStates.waiting_for_invite_link)
+        prompt = "Telegram join-request taklif havolasini (https://t.me/...) yuboring; /cancel — bekor qilish."
+    await callback.message.edit_text(prompt)
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "admin:membership:toggle", AdminAccessFilter())
+async def toggle_membership_gate(callback: CallbackQuery) -> None:
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer("Bu sozlamani faqat shaxsiy admin chatida o‘zgartiring.", show_alert=True)
+        return
+    try:
+        current = await get_join_settings()
+        if not current.enabled and (current.chat_id is None or not current.invite_link):
+            await callback.answer("Avval chat ID va join-request havolasini sozlang.", show_alert=True)
+            return
+        await update_join_settings(admin_id=callback.from_user.id, enabled=not current.enabled)
+    except (SQLAlchemyError, RuntimeError) as error:
+        logger.error("Join settings update failed: error_type=%s", type(error).__name__)
+        await callback.answer("A’zolik talabini yangilab bo‘lmadi.", show_alert=True)
+        return
+    await _show_membership_settings(callback)
+
+
+@admin_router.message(StateFilter(MembershipSettingsStates), AdminAccessFilter())
+async def receive_membership_setting(message: Message, state: FSMContext) -> None:
+    if message.chat.type != "private":
+        await message.answer("Sozlamani faqat shaxsiy admin chatida kiriting.")
+        return
+    value = (message.text or "").strip()
+    if value.lower() == "/cancel":
+        await state.clear()
+        await message.answer("Bekor qilindi. /admin orqali davom eting.")
+        return
+    current = await state.get_state()
+    if current == MembershipSettingsStates.waiting_for_chat_id.state:
+        try:
+            chat_id = int(value)
+        except ValueError:
+            await message.answer("Chat ID butun son bo‘lishi kerak.")
+            return
+        if chat_id >= 0:
+            await message.answer("Guruh yoki superguruh chat ID si manfiy son bo‘lishi kerak.")
+            return
+        update = {"chat_id": chat_id}
+    else:
+        from urllib.parse import urlsplit
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or parsed.hostname not in {"t.me", "telegram.me"} or not parsed.path.strip("/"):
+            await message.answer("Telegram join-request havolasi https://t.me/... formatida bo‘lishi kerak.")
+            return
+        update = {"invite_link": value}
+    try:
+        await update_join_settings(admin_id=message.from_user.id, **update)
+    except (SQLAlchemyError, RuntimeError) as error:
+        logger.error("Join settings update failed: error_type=%s", type(error).__name__)
+        await state.clear()
+        await message.answer("Sozlamani saqlab bo‘lmadi.")
+        return
+    await state.clear()
+    settings = await get_join_settings()
+    status = "Yoqilgan" if settings.enabled else "O‘chiq"
+    await message.answer(
+        f"✅ A’zolik sozlamasi saqlandi. Hozirgi holat: <b>{status}</b>.",
+        reply_markup=admin_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 @admin_router.callback_query(

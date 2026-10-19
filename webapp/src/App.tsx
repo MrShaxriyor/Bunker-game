@@ -4,6 +4,7 @@ import {
   ArrowDownLeft,
   ArrowRight,
   ArrowUpRight,
+  Archive,
   Check,
   ChevronRight,
   CircleHelp,
@@ -25,15 +26,18 @@ import {
   createCatalogDiagnostics,
   fetchCatalog,
   fetchGiftHistory,
+  fetchGiftInventory,
   fetchMe,
   getOrCreateIdempotencyKey,
   shouldEnableCatalogDiagnostics,
   sendGift,
+  sellGiftInventoryItem,
 } from './lib/api'
 import type {
   CatalogDiagnostics,
   GiftHistoryPage,
   GiftHistoryRecord,
+  GiftInventoryItem,
   GiftSendResponse,
   Me,
   ShopGift,
@@ -149,6 +153,13 @@ function App() {
   const [history, setHistory] = useState<GiftHistoryPage | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyError, setHistoryError] = useState('')
+  const [inventory, setInventory] = useState<GiftInventoryItem[]>([])
+  const [inventoryLoading, setInventoryLoading] = useState(false)
+  const [inventoryError, setInventoryError] = useState('')
+  const [selectedInventoryId, setSelectedInventoryId] = useState<number | null>(null)
+  const [sellingInventory, setSellingInventory] = useState(false)
+  const [inventoryActionError, setInventoryActionError] = useState('')
+  const [inventoryActionSuccess, setInventoryActionSuccess] = useState('')
   const historyRequestId = useRef(0)
 
   useEffect(() => {
@@ -275,6 +286,54 @@ function App() {
     }
   }, [initData, isDemo])
 
+  const loadInventory = useCallback(async () => {
+    if (isDemo) {
+      setInventory([])
+      setInventoryError('')
+      setInventoryLoading(false)
+      return
+    }
+    if (!initData) {
+      setInventoryError('Inventarni ko‘rish uchun Telegram ichidan oching.')
+      setInventoryLoading(false)
+      return
+    }
+    setInventoryLoading(true)
+    setInventoryError('')
+    try {
+      const result = await fetchGiftInventory(initData)
+      setInventory(result.items)
+    } catch (error) {
+      setInventoryError(getErrorMessage(error))
+    } finally {
+      setInventoryLoading(false)
+    }
+  }, [initData, isDemo])
+
+  const handleSellInventory = async (item: GiftInventoryItem) => {
+    if (!initData || sellingInventory || item.status === 'sold') return
+    setSellingInventory(true)
+    setInventoryActionError('')
+    setInventoryActionSuccess('')
+    try {
+      const result = await sellGiftInventoryItem(initData, item.id)
+      setInventory((current) => current.map((entry) => (
+        entry.id === item.id ? result.item : entry
+      )))
+      setProfile((current) => current && {
+        ...current,
+        balance_coins: result.balance_coins,
+      })
+      setInventoryActionSuccess(
+        `Sovg‘a sotildi. +${formatCoins(result.item.resale_price_coins)} coin balansga qo‘shildi.`,
+      )
+    } catch (error) {
+      setInventoryActionError(getErrorMessage(error))
+    } finally {
+      setSellingInventory(false)
+    }
+  }
+
   const featuredGift = gifts[0]
   const greetingName = profile?.active_para?.partner_display_name
   const openGift = (gift: ShopGift) => {
@@ -358,6 +417,7 @@ function App() {
   const contentTitle = useMemo(() => {
     if (activeTab === 'shop') return 'Sovg‘alar do‘koni'
     if (activeTab === 'history') return 'Sovg‘alar tarixi'
+    if (activeTab === 'inventory') return 'Sovg‘alar inventari'
     return 'Bosh sahifa'
   }, [activeTab])
 
@@ -384,6 +444,7 @@ function App() {
             onClick={() => {
               void loadProfile()
               void loadCatalog()
+              if (activeTab === 'inventory') void loadInventory()
               if (activeTab === 'history') {
                 setHistoryLoading(true)
                 setHistoryError('')
@@ -448,6 +509,20 @@ function App() {
             demo={isDemo}
           />
         )}
+        {activeTab === 'inventory' && (
+          <InventoryPage
+            items={inventory}
+            loading={inventoryLoading}
+            error={inventoryError}
+            demo={isDemo}
+            onRetry={() => void loadInventory()}
+            onSelect={(item) => {
+              setInventoryActionError('')
+              setInventoryActionSuccess('')
+              setSelectedInventoryId(item.id)
+            }}
+          />
+        )}
       </main>
 
       <nav className="bottom-nav" aria-label="Asosiy navigatsiya">
@@ -463,6 +538,12 @@ function App() {
         }}>
           <Gift size={20} />
         </NavButton>
+        <NavButton active={activeTab === 'inventory'} label="Inventar" onClick={() => {
+          void loadInventory()
+          setActiveTab('inventory')
+        }}>
+          <Archive size={20} />
+        </NavButton>
       </nav>
 
       {selectedGift && (
@@ -475,6 +556,22 @@ function App() {
           onClose={closeGiftDialog}
           onConfirm={() => void handleSendGift()}
           demo={isDemo}
+        />
+      )}
+      {inventory.find((item) => item.id === selectedInventoryId) && (
+        <InventoryDetailDialog
+          item={inventory.find((item) => item.id === selectedInventoryId)!}
+          selling={sellingInventory}
+          error={inventoryActionError}
+          success={inventoryActionSuccess}
+          onClose={() => {
+            if (!sellingInventory) {
+              setSelectedInventoryId(null)
+              setInventoryActionError('')
+              setInventoryActionSuccess('')
+            }
+          }}
+          onSell={(item) => void handleSellInventory(item)}
         />
       )}
     </div>
@@ -797,6 +894,120 @@ function HistoryCard({
         <small>coin</small>
       </div>
     </article>
+  )
+}
+
+function InventoryPage({
+  items,
+  loading,
+  error,
+  demo,
+  onRetry,
+  onSelect,
+}: {
+  items: GiftInventoryItem[]
+  loading: boolean
+  error: string
+  demo: boolean
+  onRetry: () => void
+  onSelect: (item: GiftInventoryItem) => void
+}) {
+  if (loading) return <LoadingCard label="Inventar yuklanmoqda..." />
+  if (error) return <ErrorCard message={error} onRetry={onRetry} />
+  if (!items.length) {
+    return (
+      <EmptyState
+        icon={<Archive size={27} />}
+        title="Inventaringiz hozircha bo‘sh"
+        description={demo
+          ? 'Haqiqiy sovg‘alar Telegram sessiyasi orqali yuklanadi.'
+          : 'Sizga yuborilgan Para Gifts sovg‘alari shu yerda paydo bo‘ladi.'}
+      />
+    )
+  }
+  return (
+    <section className="inventory-page" aria-label="Sovg‘alar inventari">
+      <p className="inventory-intro">Qabul qilgan sovg‘alaringiz va ularning holati.</p>
+      <div className="inventory-grid">
+        {items.map((item) => (
+          <button
+            className="inventory-card"
+            key={item.id}
+            type="button"
+            onClick={() => onSelect(item)}
+          >
+            <span className="inventory-art" aria-hidden="true">{item.image_emoji || '🎁'}</span>
+            <span className="inventory-card-copy">
+              <strong>{item.gift_name}</strong>
+              <small>{formatDate(item.received_at)}</small>
+              <span className={`inventory-status${item.status === 'sold' ? ' inventory-status-sold' : ''}`}>
+                {item.status === 'sold' ? 'Sotilgan' : 'Inventarda'}
+              </span>
+            </span>
+            <span className="inventory-resale-price">
+              <Coins size={13} /> {formatCoins(item.resale_price_coins)}
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function InventoryDetailDialog({
+  item,
+  selling,
+  error,
+  success,
+  onClose,
+  onSell,
+}: {
+  item: GiftInventoryItem
+  selling: boolean
+  error: string
+  success: string
+  onClose: () => void
+  onSell: (item: GiftInventoryItem) => void
+}) {
+  const [confirming, setConfirming] = useState(false)
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget && !selling) onClose()
+    }}>
+      <section className="gift-dialog inventory-dialog" role="dialog" aria-modal="true" aria-labelledby="inventory-dialog-title">
+        <button className="dialog-close" type="button" aria-label="Yopish" disabled={selling} onClick={onClose}>
+          <X size={19} />
+        </button>
+        <span className="inventory-detail-art" aria-hidden="true">{item.image_emoji || '🎁'}</span>
+        <span className="dialog-eyebrow">SOVG‘A TAFSILOTI</span>
+        <h2 id="inventory-dialog-title">{item.gift_name}</h2>
+        <div className="inventory-detail-list">
+          <span>Kim yubordi <strong>{item.sender_name} · {item.sender_id}</strong></span>
+          <span>Kimga yuborildi <strong>{item.recipient_name} · {item.recipient_id}</strong></span>
+          <span>Yuborilgan vaqt <strong>{formatDate(item.received_at)}</strong></span>
+          <span>Asl narxi <strong>{formatCoins(item.original_price_coins)} coin</strong></span>
+          <span>Qayta sotish narxi <strong>{formatCoins(item.resale_price_coins)} coin</strong></span>
+          <span>Holati <strong>{item.status === 'sold' ? `Sotilgan · ${item.sold_at ? formatDate(item.sold_at) : ''}` : 'Inventarda'}</strong></span>
+        </div>
+        {error && <p className="dialog-error" role="alert">{error}</p>}
+        {success && <p className="inventory-success" role="status">{success}</p>}
+        {item.status === 'sold' ? (
+          <p className="inventory-sold-note">Bu sovg‘a sotilgan. U inventar tarixida saqlanadi.</p>
+        ) : confirming ? (
+          <div className="inventory-confirm-box">
+            <strong>Sovg‘ani {formatCoins(item.resale_price_coins)} coin’ga sotishni tasdiqlaysizmi?</strong>
+            <button className="primary-button dialog-primary" type="button" disabled={selling} onClick={() => onSell(item)}>
+              {selling ? <><LoaderCircle className="spin" size={17} /> Sotilmoqda...</> : 'Ha, sotish'}
+            </button>
+            <button className="secondary-button" type="button" disabled={selling} onClick={() => setConfirming(false)}>Bekor qilish</button>
+          </div>
+        ) : (
+          <button className="primary-button dialog-primary" type="button" onClick={() => setConfirming(true)}>
+            <Coins size={16} /> Yarim narxida sotish
+          </button>
+        )}
+      </section>
+    </div>
   )
 }
 
